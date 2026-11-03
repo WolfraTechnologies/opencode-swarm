@@ -12,6 +12,12 @@
  * opts in (`permission_policy.trust_code_mode_wrapper`, default false) and the
  * program is exactly one plain-data tool call. On a v1 host nothing is marked.
  *
+ * The delegation gate's task-completion gate also reads the mark, without an
+ * opt-in, and skips only the wrapper itself. That gate orders task workflow;
+ * it is not a permission boundary. Each nested call still passes through it
+ * under its own name, so a wrongly marked call skips the completion check for
+ * that one call only.
+ *
  * Side-channel shape mirrors `src/sandbox/skip-state.ts` (keyed by
  * session + call, bounded, FIFO-evicted) so session state stays bounded
  * (invariant 8).

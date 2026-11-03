@@ -191,6 +191,7 @@ export { resetStandardWorktreeIsolationState };
 
 import { matchesTier3 } from '../parallel/tier3-classifier.js';
 import { pushAdvisory } from '../utils/advisory-queue';
+import { isCodeModeWrapperCall } from './code-mode-wrapper';
 import { _internals as _wtiInternals } from './delegation-gate/worktree-isolation';
 import {
 	initDurableStatusPath,
@@ -4606,8 +4607,16 @@ export function createDelegationGateHook(
 
 		// ── Completion gate: blocks starting a different task after QA gates pass ──
 		// Runs for ALL tools (declare_scope, update_task_status, Task), not just Task.
+		// The OpenCode v2 Code Mode `execute` wrapper is the one exception: the
+		// host dispatches every nested `tools.<name>()` call through this same
+		// before chain under its own name, so the gate judges each nested call
+		// (including the update_task_status that clears it). Judging the wrapper
+		// by its own name denied every nested call, so nothing could clear it.
 		const completionArgs = output.args as Record<string, unknown> | undefined;
-		if (completionArgs) {
+		const isHostCodeModeWrapper =
+			input.tool === 'execute' &&
+			isCodeModeWrapperCall(input.sessionID, input.callID);
+		if (completionArgs && !isHostCodeModeWrapper) {
 			// Load plan task IDs for plan-aware text extraction (filters version numbers)
 			let completionPlanContext: PlanTaskIdContext | undefined;
 			try {
