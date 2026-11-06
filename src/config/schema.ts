@@ -1643,6 +1643,18 @@ export const KnowledgeConfigSchema = z.object({
 	min_retrievals_for_utility: z.number().min(1).max(100).default(3),
 	/** Days to retain closed V2 receipt membership after phase closure. */
 	receipt_close_grace_days: z.number().int().min(0).max(3650).default(7),
+	/**
+	 * Read budget (MiB) for a FULL-history query over the receipt archive
+	 * segments (outcome history, escalation windows, promotion evidence). Raise-
+	 * only: 128 is the floor. The per-message counter rollups and live receipt
+	 * operations never read all of history and ignore this budget.
+	 */
+	receipt_archive_history_budget_mb: z
+		.number()
+		.int()
+		.min(128)
+		.max(4096)
+		.default(128),
 	/** Schema version for the knowledge store format */
 	schema_version: z.number().int().min(1).default(1),
 	/** v2: Confidence threshold above which a tool/agent match strongly boosts ranking. Default: 0.75 */

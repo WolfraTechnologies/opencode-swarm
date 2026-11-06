@@ -42,10 +42,15 @@
   simply becomes the tail. A row already in the tail is skipped only when identical, and a changed
   copy replaces it, which also closes a window where a terminal filed after an interrupted archive
   pass could be lost. Readers resolve a key to its newest copy.
-- **History reads no longer hold the ledger lock.** `queryHistoricalOutcomes` reads the tail under
-  the lock and the immutable sealed segments after releasing it, bounded by a 128 MiB history read
-  budget (typed `store_unavailable` beyond it; live operations are unaffected). A damaged sealed
-  segment fails history with `store_corrupt` without blocking live operations.
+- **Reading history is cheap on the hot path and no longer holds the ledger lock.** The
+  per-message counter rollups reuse an in-process cache of each immutable sealed segment's
+  contribution (keyed by file identity), so after the first call per process they cost live + tail,
+  independent of history size. Full-history queries (`queryHistoricalOutcomes`: outcome history,
+  escalation windows, promotion evidence) read the tail under the lock and the sealed segments after
+  releasing it, bounded by the new `knowledge.receipt_archive_history_budget_mb` (default `128`,
+  raise-only, max `4096`); past it they fail typed and one critical warning is logged. A damaged
+  sealed segment fails those queries with `store_corrupt` without blocking live operations, and a
+  stray non-regular file with a segment name can no longer wedge compaction.
 - **`/swarm close` copies every archive segment** into its forensic bundle and still never removes
   them.
 
@@ -57,8 +62,9 @@ session that closed that id earlier closes it again (the ledger deduplicates a r
 the same session and phase id). A journal made only of such rows, or of an unusually large open
 phase, can still grow toward the receipt store's 32 MiB journal read limit, beyond which every
 receipt operation reports `store_corrupt` and `phase_complete` reports `PHASE_SNAPSHOT_BYTE_LIMIT`.
-Total archive history is lossless and unbounded on disk; only the 128 MiB history read budget bounds
-what a single rollup query will read.
+Archive history is lossless and unbounded on disk. Full-history consumers (outcome history,
+escalation, promotion evidence) stop working past the history read budget until it is raised, and a
+row left in two segments by a crash is counted once per copy by the cached counter rollups.
 
 ## Migration
 

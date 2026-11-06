@@ -7,15 +7,19 @@ import {
 } from '../config/schema.js';
 import { observeReceiptTransition } from '../health/learning-health';
 import { sanitizeDiagnosticText } from '../scope/path-identity.js';
+import { criticalWarn } from '../utils/logger.js';
 import { extractPhaseIdFromLabel } from './extractors.js';
 import {
 	appendFsynced,
+	assertNoIrregularArchiveSegments,
 	atomicWriteFsynced,
 	listReceiptArchiveSegments,
 	MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES,
 	MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX,
+	RECEIPT_ARCHIVE_BASE_NAME,
 	RECEIPT_CUTOVER_VERSION,
 	RECEIPT_SCHEMA_VERSION,
+	type ReceiptArchiveSegment,
 	type ReceiptLedgerPaths,
 	ReceiptStoreError,
 	type ReceiptStoreErrorCode,
@@ -467,6 +471,30 @@ function configuredGraceDays(directory: string): number {
 			.receipt_close_grace_days;
 	} catch {
 		return DEFAULT_RECEIPT_GRACE_DAYS;
+	}
+}
+
+/**
+ * Full-history read budget in bytes. The configured value can only RAISE the
+ * default (schema floor), so config is consulted only once the default is
+ * already exceeded — the common path never loads config here. A test override
+ * on `_internals` wins so budgets can be forced small.
+ */
+function historyBudgetBytes(directory: string, totalBytes: number): number {
+	if (_internals.maxArchiveHistoryBytes !== undefined) {
+		return _internals.maxArchiveHistoryBytes;
+	}
+	if (totalBytes <= MAX_ARCHIVE_HISTORY_BYTES) return MAX_ARCHIVE_HISTORY_BYTES;
+	try {
+		const { config } = loadPluginConfigWithMeta(directory);
+		return (
+			KnowledgeConfigSchema.parse(config.knowledge ?? {})
+				.receipt_archive_history_budget_mb *
+			1024 *
+			1024
+		);
+	} catch {
+		return MAX_ARCHIVE_HISTORY_BYTES;
 	}
 }
 
@@ -3963,44 +3991,93 @@ export async function queryLiveMemberships(
 	);
 }
 
+const ARCHIVE_INVALID_AUTHORITATIVE =
+	'receipt archive contains an invalid authoritative summary';
+
+interface CapturedHistory {
+	/** Live rows, consistent under the ledger lock. */
+	live: Map<string, ReceiptMembership>;
+	/** Rows of the active tail, captured under the same lock. */
+	tailRows: ArchiveSummary[];
+	/** Sealed (immutable) segments, oldest first. NOT read here. */
+	sealed: ReceiptArchiveSegment[];
+	totalBytes: number;
+}
+
+/**
+ * Run under the ledger lock: a consistent view of the live rows, the segment
+ * list and the ACTIVE tail (the only segment a concurrent compaction can
+ * rewrite). Sealed segments are immutable, so callers read them AFTER the
+ * lock is released — a long history read must never hold up writers behind
+ * the 500 ms lock budget. An irregular segment name fails closed: a replaced
+ * segment would silently drop history.
+ */
+async function captureHistory(
+	paths: ReceiptLedgerPaths,
+	state: LedgerState,
+	wanted: Set<string> | null,
+): Promise<CapturedHistory> {
+	const live = new Map<string, ReceiptMembership>();
+	for (const membership of state.memberships.values()) {
+		if (!wanted || wanted.has(membership.entry_id)) {
+			live.set(archiveKey(membership), membership);
+		}
+	}
+	const listing = await listReceiptArchiveSegments(paths);
+	assertNoIrregularArchiveSegments(listing);
+	const tail = listing.segments.at(-1);
+	const tailRows = tail
+		? parseArchiveSegment(
+				await _internals.readArchiveSegmentFile(tail.filePath),
+				ARCHIVE_INVALID_AUTHORITATIVE,
+			)
+		: [];
+	return {
+		live,
+		tailRows,
+		sealed: listing.segments.slice(0, -1),
+		totalBytes: listing.segments.reduce((sum, item) => sum + item.bytes, 0),
+	};
+}
+
+const archiveBudgetWarned = new Set<string>();
+
+/** One operator-visible warning per project when history outgrows its budget. */
+function warnArchiveHistoryBudget(
+	root: string,
+	totalBytes: number,
+	budget: number,
+): void {
+	if (archiveBudgetWarned.has(root)) return;
+	if (archiveBudgetWarned.size >= 32) archiveBudgetWarned.clear();
+	archiveBudgetWarned.add(root);
+	// An operational condition the operator must see (the debug-gated `warn`
+	// would be silent): full-history consumers are degraded until it is acted on.
+	criticalWarn(
+		`[knowledge-receipts] archive history is ${totalBytes} bytes, over the ${budget}-byte full-history read budget: outcome history, escalation and promotion evidence are unavailable. Raise knowledge.receipt_archive_history_budget_mb to restore them (max 4096). Counter rollups and live receipt operations are unaffected.`,
+	);
+}
+
 export async function queryHistoricalOutcomes(
 	directory: string,
 	entryIds?: string[],
 	graceDays?: number,
 ): Promise<ReceiptLedgerResult<{ memberships: ReceiptMembership[] }>> {
 	const wanted = entryIds ? new Set(entryIds) : null;
-	const invalid = 'receipt archive contains an invalid authoritative summary';
-	// Under the ledger lock: a consistent view of the live rows, the segment
-	// list, and the ACTIVE tail (the only segment a concurrent compaction can
-	// rewrite). Sealed segments are immutable, so they are read AFTER the lock
-	// is released — a long history read must never hold up the injection hot
-	// path behind the 500 ms lock budget.
 	const captured = await runLocked(
 		directory,
 		graceDays,
 		async (paths, state) => {
-			const live = new Map<string, ReceiptMembership>();
-			for (const membership of state.memberships.values()) {
-				if (!wanted || wanted.has(membership.entry_id)) {
-					live.set(archiveKey(membership), membership);
-				}
-			}
-			const segments = await listReceiptArchiveSegments(paths);
-			const totalBytes = segments.reduce((sum, item) => sum + item.bytes, 0);
-			if (totalBytes > _internals.maxArchiveHistoryBytes) {
+			const history = await captureHistory(paths, state, wanted);
+			const budget = historyBudgetBytes(directory, history.totalBytes);
+			if (history.totalBytes > budget) {
+				warnArchiveHistoryBudget(paths.root, history.totalBytes, budget);
 				throw new ReceiptStoreError(
 					'store_unavailable',
-					`receipt archive history is ${totalBytes} bytes, over the ${_internals.maxArchiveHistoryBytes}-byte history read budget`,
+					`receipt archive history is ${history.totalBytes} bytes, over the ${budget}-byte history read budget (knowledge.receipt_archive_history_budget_mb)`,
 				);
 			}
-			const tail = segments.at(-1);
-			const tailRows = tail
-				? parseArchiveSegment(
-						await readUtf8IfPresent(tail.filePath, MAX_ARCHIVE_BYTES),
-						invalid,
-					)
-				: [];
-			return { live, sealed: segments.slice(0, -1), tailRows };
+			return history;
 		},
 		{ compact: false, writeSnapshot: false },
 	);
@@ -4022,8 +4099,8 @@ export async function queryHistoricalOutcomes(
 		for (const segment of captured.sealed) {
 			absorb(
 				parseArchiveSegment(
-					await readUtf8IfPresent(segment.filePath, MAX_ARCHIVE_BYTES),
-					invalid,
+					await _internals.readArchiveSegmentFile(segment.filePath),
+					ARCHIVE_INVALID_AUTHORITATIVE,
 				),
 			);
 		}
@@ -4036,6 +4113,59 @@ export async function queryHistoricalOutcomes(
 	} catch (error) {
 		return unavailable(error);
 	}
+}
+
+export interface HistoricalMembershipSources {
+	/** Live rows plus the active tail's rows, one per key, live winning. */
+	current: ReceiptMembership[];
+	/**
+	 * Sealed segments, oldest first. `identity` changes whenever the file is
+	 * rewritten, so it is a safe cache key for anything derived from `read()`.
+	 * Rows are read on demand, outside the ledger lock.
+	 */
+	sealed: Array<{ identity: string; read: () => Promise<ReceiptMembership[]> }>;
+}
+
+/**
+ * The same history `queryHistoricalOutcomes` exposes, split so a consumer that
+ * folds it into a small aggregate (the counter rollups, which sit on the
+ * per-message injection path) can compute each IMMUTABLE sealed segment's
+ * contribution once and reuse it, instead of re-reading all of history every
+ * time. There is deliberately no total-size budget here: sealed segments are
+ * streamed one at a time and the caller keeps only its aggregate.
+ */
+export async function readHistoricalMembershipSources(
+	directory: string,
+	graceDays?: number,
+): Promise<ReceiptLedgerResult<{ sources: HistoricalMembershipSources }>> {
+	const captured = await runLocked(
+		directory,
+		graceDays,
+		(paths, state) => captureHistory(paths, state, null),
+		{ compact: false, writeSnapshot: false },
+	);
+	if (!captured.ok) return captured;
+	const byKey = new Map<string, ReceiptMembership>();
+	for (const summary of captured.tailRows) {
+		if ('entry_id' in summary) byKey.set(archiveKey(summary), summary);
+	}
+	for (const [key, membership] of captured.live) byKey.set(key, membership);
+	return {
+		ok: true,
+		sources: {
+			current: [...byKey.values()],
+			sealed: captured.sealed.map((segment) => ({
+				identity: segment.identity,
+				read: async () =>
+					parseArchiveSegment(
+						await _internals.readArchiveSegmentFile(segment.filePath),
+						ARCHIVE_INVALID_AUTHORITATIVE,
+					).filter(
+						(summary): summary is ReceiptMembership => 'entry_id' in summary,
+					),
+			})),
+		},
+	};
 }
 
 /**
@@ -4376,13 +4506,29 @@ async function compactIfNeeded(
 			}),
 		),
 	];
-	if (pending.length > 0) await archiveSummaries(paths, pending);
+	const archived =
+		pending.length > 0
+			? await archiveSummaries(paths, pending)
+			: new Set<string>();
+	let removed = 0;
 	for (const membership of eligible) {
+		if (!archived.has(archiveKey(membership))) continue;
 		state.memberships.delete(keyOf(membership.trace_id, membership.entry_id));
+		removed += 1;
 	}
 	for (const trace of eligibleEmpty) {
+		if (!archived.has(archiveKey({ ...trace, summary_kind: 'empty_trace' }))) {
+			continue;
+		}
 		state.emptyTraces.delete(emptyKeyOf(trace.trace_id, trace.session_id));
+		removed += 1;
 	}
+	// Only a row too large for any segment is left live (see archiveSummaries).
+	// Without this guard such a row would make every locked operation rewrite an
+	// identical checkpoint, so rewrite only when a row moved or the record
+	// threshold demands it.
+	if (removed === 0 && state.recordCount <= _internals.maxJournalRecords)
+		return;
 	for (const traceId of [...state.legacyTraceRegistry]) {
 		const stillLive = [...state.memberships.values()].some(
 			(membership) =>
@@ -4447,66 +4593,86 @@ interface ArchiveBucket {
 async function archiveSummaries(
 	paths: ReceiptLedgerPaths,
 	summaries: ArchiveSummary[],
-): Promise<void> {
-	const segments = await listReceiptArchiveSegments(paths);
-	const tail = segments.at(-1) ?? { index: 0, filePath: paths.archive };
+): Promise<Set<string>> {
+	// Lenient listing: an irregular segment name (a stray symlink/directory)
+	// must not be able to wedge compaction and strand rows in the journal. It
+	// is never read, written through, or reused — new segments are allocated
+	// above the highest name in use. History reads still fail closed on it.
+	const listing = await listReceiptArchiveSegments(paths);
+	const tail =
+		listing.segments.at(-1) ??
+		(listing.irregular.includes(RECEIPT_ARCHIVE_BASE_NAME)
+			? undefined
+			: { index: 0, filePath: paths.archive });
+	let nextIndex = Math.max(listing.highestIndex, tail?.index ?? 0) + 1;
 	const lineBytes = (summary: ArchiveSummary): number =>
 		Buffer.byteLength(`${JSON.stringify(summary)}\n`, 'utf8');
-	const tailRows = new Map<string, ArchiveSummary>();
-	let tailBytes = 0;
-	for (const row of parseArchiveSegment(
-		await readUtf8IfPresent(tail.filePath, MAX_ARCHIVE_BYTES),
-		'receipt archive contains an invalid summary',
-	)) {
-		const key = archiveKey(row);
-		const prior = tailRows.get(key);
-		if (prior !== undefined) tailBytes -= lineBytes(prior);
-		tailRows.set(key, row);
-		tailBytes += lineBytes(row);
-	}
-	const buckets: ArchiveBucket[] = [
-		{
+	const buckets: ArchiveBucket[] = [];
+	if (tail) {
+		const tailRows = new Map<string, ArchiveSummary>();
+		let tailBytes = 0;
+		for (const row of parseArchiveSegment(
+			await _internals.readArchiveSegmentFile(tail.filePath),
+			'receipt archive contains an invalid summary',
+		)) {
+			const key = archiveKey(row);
+			const prior = tailRows.get(key);
+			if (prior !== undefined) tailBytes -= lineBytes(prior);
+			tailRows.set(key, row);
+			tailBytes += lineBytes(row);
+		}
+		buckets.push({
 			index: tail.index,
 			filePath: tail.filePath,
 			rows: tailRows,
 			bytes: tailBytes,
 			dirty: false,
-		},
-	];
+		});
+	}
+	const tailBucket = tail ? buckets[0] : undefined;
 	const fits = (bucket: ArchiveBucket, bytes: number): boolean =>
 		bucket.rows.size < _internals.maxArchiveRecords &&
 		bucket.bytes + bytes <= _internals.maxArchiveBytes;
+	const archived = new Set<string>();
 	for (const summary of summaries) {
 		const key = archiveKey(summary);
-		const prior = buckets[0].rows.get(key);
-		if (prior !== undefined) {
-			if (stableJson(prior) === stableJson(summary)) continue;
-			buckets[0].rows.delete(key);
-			buckets[0].bytes -= lineBytes(prior);
-			buckets[0].dirty = true;
-		}
 		const bytes = lineBytes(summary);
+		// A single row larger than a whole segment cannot be stored in a segment
+		// that stays readable; it stays live (the pre-segmentation behaviour for
+		// a row that cannot be archived) rather than producing an unreadable file.
+		if (bytes > _internals.maxArchiveBytes) continue;
+		const prior = tailBucket?.rows.get(key);
+		if (tailBucket && prior !== undefined) {
+			if (stableJson(prior) === stableJson(summary)) {
+				archived.add(key);
+				continue;
+			}
+			tailBucket.rows.delete(key);
+			tailBucket.bytes -= lineBytes(prior);
+			tailBucket.dirty = true;
+		}
 		let target = buckets.find((bucket) => fits(bucket, bytes));
 		if (!target) {
-			const index = tail.index + buckets.length;
-			if (index > MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX) {
+			if (nextIndex > MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX) {
 				throw new ReceiptStoreError(
 					'store_unavailable',
 					'receipt archive has no segment index left',
 				);
 			}
 			target = {
-				index,
-				filePath: receiptArchiveSegmentPath(paths, index),
+				index: nextIndex,
+				filePath: receiptArchiveSegmentPath(paths, nextIndex),
 				rows: new Map(),
 				bytes: 0,
 				dirty: false,
 			};
+			nextIndex += 1;
 			buckets.push(target);
 		}
 		target.rows.set(key, summary);
 		target.bytes += bytes;
 		target.dirty = true;
+		archived.add(key);
 	}
 	for (const bucket of buckets) {
 		if (bucket.dirty) {
@@ -4516,6 +4682,7 @@ async function archiveSummaries(
 			);
 		}
 	}
+	return archived;
 }
 
 function serializeArchive(summaries: ArchiveSummary[]): string {
@@ -4658,6 +4825,10 @@ export const _internals = {
 	maxJournalRecords: MAX_JOURNAL_RECORDS,
 	maxArchiveRecords: MAX_ARCHIVE_RECORDS,
 	maxArchiveBytes: MAX_ARCHIVE_BYTES,
-	maxArchiveHistoryBytes: MAX_ARCHIVE_HISTORY_BYTES,
+	/** Test override for the full-history read budget; undefined = default/config. */
+	maxArchiveHistoryBytes: undefined as number | undefined,
+	/** Single read path for archive segments (also the test seam for read counts). */
+	readArchiveSegmentFile: (filePath: string): Promise<string | null> =>
+		readUtf8IfPresent(filePath, MAX_ARCHIVE_BYTES),
 	maxRepairQuarantineRecords: MAX_REPAIR_QUARANTINE_RECORDS,
 };

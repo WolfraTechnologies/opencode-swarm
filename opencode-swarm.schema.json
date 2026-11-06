@@ -2214,6 +2214,12 @@
           "minimum": 0,
           "maximum": 3650
         },
+        "receipt_archive_history_budget_mb": {
+          "default": 128,
+          "type": "integer",
+          "minimum": 128,
+          "maximum": 4096
+        },
         "schema_version": {
           "default": 1,
           "type": "integer",

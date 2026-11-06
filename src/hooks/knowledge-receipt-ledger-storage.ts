@@ -127,6 +127,8 @@ export interface ReceiptArchiveSegment {
 	index: number;
 	filePath: string;
 	bytes: number;
+	/** `index:ino:size:mtimeMs` — changes whenever the file is rewritten. */
+	identity: string;
 }
 
 export function receiptArchiveSegmentPath(
@@ -150,37 +152,74 @@ export function receiptArchiveSegmentPath(
 	);
 }
 
+export interface ReceiptArchiveListing {
+	/** Regular-file segments in ascending index order (base file first). */
+	segments: ReceiptArchiveSegment[];
+	/**
+	 * Highest index among EVERY matching name, regular or not (-1 when none).
+	 * New segments are allocated above it so a name that is occupied by
+	 * something irregular is never reused or written through.
+	 */
+	highestIndex: number;
+	/** Matching names that are not regular files (symlink, directory, ...). */
+	irregular: string[];
+}
+
 /**
- * Existing archive segments in ascending index order (base file first). Every
- * segment must be a regular file: a symlink or directory fails closed rather
- * than being followed or skipped.
+ * Existing archive segments. Nothing here follows or reads an irregular
+ * entry; it is REPORTED, and the caller decides: a history read must fail
+ * closed (a replaced segment would silently drop history), while compaction
+ * only needs to avoid its name so a stray file can never wedge the journal.
  */
 export async function listReceiptArchiveSegments(
 	paths: ReceiptLedgerPaths,
-): Promise<ReceiptArchiveSegment[]> {
+): Promise<ReceiptArchiveListing> {
 	let names: string[];
 	try {
 		names = await readdir(paths.swarmDir);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return { segments: [], highestIndex: -1, irregular: [] };
+		}
 		throw error;
 	}
 	const segments: ReceiptArchiveSegment[] = [];
+	const irregular: string[] = [];
+	let highestIndex = -1;
 	for (const name of names) {
 		const index =
 			name === RECEIPT_ARCHIVE_BASE_NAME ? 0 : numberedSegmentIndex(name);
 		if (index === undefined) continue;
+		highestIndex = Math.max(highestIndex, index);
 		const filePath = receiptArchiveSegmentPath(paths, index);
 		const info = await lstat(filePath);
 		if (info.isSymbolicLink() || !info.isFile()) {
-			throw new ReceiptStoreError(
-				'store_unavailable',
-				`receipt artifact is not a regular file: ${name}`,
-			);
+			irregular.push(name);
+			continue;
 		}
-		segments.push({ index, filePath, bytes: info.size });
+		segments.push({
+			index,
+			filePath,
+			bytes: info.size,
+			// Sealed segments are immutable, so a changed identity means a
+			// rewritten (or replaced) file: safe as an in-process cache key.
+			identity: `${index}:${info.ino}:${info.size}:${info.mtimeMs}`,
+		});
 	}
-	return segments.sort((left, right) => left.index - right.index);
+	segments.sort((left, right) => left.index - right.index);
+	return { segments, highestIndex, irregular: irregular.sort() };
+}
+
+/** Throw the fail-closed error for a listing that contains irregular names. */
+export function assertNoIrregularArchiveSegments(
+	listing: ReceiptArchiveListing,
+): void {
+	if (listing.irregular.length > 0) {
+		throw new ReceiptStoreError(
+			'store_unavailable',
+			`receipt artifact is not a regular file: ${listing.irregular[0]}`,
+		);
+	}
 }
 
 function validateExistingRegularFile(filePath: string): void {

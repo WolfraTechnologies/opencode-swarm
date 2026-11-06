@@ -263,7 +263,8 @@ All keys live under `knowledge.*` in your config (see `src/config/schema.ts:1043
 | `evergreen_utility` | float | 0.8 | Utility score for evergreen |
 | `low_utility_threshold` | float | 0.3 | Flag for removal at or below |
 | `min_retrievals_for_utility` | int | 3 | Retrievals before utility scoring |
-| `receipt_close_grace_days` | int | 7 | Days to retain resolved receipt membership after its phase closes (`0`-`3650`) |
+| `receipt_close_grace_days` | int | 7 | Days to retain receipt membership after its phase closes (`0`-`3650`); applies to resolved and unresolved membership of a closed phase |
+| `receipt_archive_history_budget_mb` | int | 128 | Read budget for full-history receipt-archive queries (`128`-`4096`, raise-only); counter rollups and live operations ignore it |
 | `default_max_phases` | int | 10 | General TTL |
 | `todo_max_phases` | int | 3 | TODO-category TTL |
 | `same_project_weight` | float | 1.0 | Encounter score (source project) |
@@ -592,25 +593,42 @@ the active tail and the only one compaction ever reads or rewrites; every lower
 segment is sealed and immutable. Each segment keeps the original bounds
 (10,000 rows / 16 MiB), but they are now *per segment*: when the tail is full the
 remainder rolls into a new segment, so an expired row never stays live because
-"the archive is full" and nothing is ever discarded. Hot-path cost (injection,
-terminals, gates, compaction) therefore does not grow with history. A row
-already in the tail is skipped only if it is identical; a changed copy (a
-terminal filed after an interrupted pass archived the earlier version) replaces
-it, and readers resolve a key to its newest copy, so a crash can leave a
-duplicate but never lose state.
+"the archive is full" and nothing is ever discarded (a single row larger than a
+whole segment is the one exception: it stays live rather than producing an
+unreadable file). A row already in the tail is skipped only if it is identical;
+a changed copy (a terminal filed after an interrupted pass archived the earlier
+version) replaces it, and readers resolve a key to its newest copy, so a crash
+can leave a duplicate but never lose state. A stray non-regular file with a
+segment name never wedges compaction: it is neither read nor reused, new
+segments are allocated above it, and full-history reads fail closed on it.
 
-`queryHistoricalOutcomes` (the source of the outcome and shown-count rollups)
-reads the tail under the ledger lock and the sealed segments after releasing it,
-so a long history read cannot hold up writers. Its total read is bounded at
-128 MiB; beyond that it fails with a typed `store_unavailable` and the rollups
-degrade, while live operations are unaffected. A damaged sealed segment fails
-history queries (`store_corrupt`) without blocking live operations; a damaged
-tail still blocks compaction, as a damaged single archive always did. The live
-journal now only holds rows that are not yet expired; it can still reach the
-32 MiB journal read limit only from live state (open phases, rows within grace,
-the two never-expired cases above), beyond which the receipt store reports
-`store_corrupt` for every operation. `/swarm close` copies every segment into
-its forensic bundle and never removes them.
+What reads how much of the archive:
+
+- **Compaction, terminals, gates, injection bookkeeping** read at most the
+  active tail (≤16 MiB), plus a directory listing.
+- **Counter rollups** (`readAuthoritativeKnowledgeCounterRollups`, on the
+  per-message injection path) fold the live rows and the tail, and reuse an
+  in-process cache of each *sealed* segment's counter contribution keyed by the
+  segment's file identity. The first call in a process streams each sealed
+  segment once; after that the cost is live + tail + a merge, and there is no
+  history size limit. Because the cache is per segment, a row that a crash left
+  in two segments is counted once per copy (a +1 on that entry's shown count),
+  which can only follow an interrupted archive pass.
+- **Full-history queries** (`queryHistoricalOutcomes`: outcome history,
+  escalation windows, promotion evidence) read the tail under the ledger lock
+  and the sealed segments after releasing it, so they cannot hold up writers.
+  They are bounded by `knowledge.receipt_archive_history_budget_mb` (default
+  128, raise-only, max 4096). Past it they fail typed (`store_unavailable`),
+  one critical warning is logged per process, and those consumers degrade;
+  live operations and the rollups are unaffected. A damaged sealed segment
+  fails these queries (`store_corrupt`) without blocking live operations; a
+  damaged tail still blocks compaction, as a damaged single archive always did.
+
+The live journal now holds only rows that are not yet expired; it can still
+reach the 32 MiB journal read limit from live state alone (open phases, rows
+within grace, the two never-expired cases above), beyond which the receipt
+store reports `store_corrupt` for every operation. `/swarm close` copies every
+segment into its forensic bundle and never removes them.
 
 `phase_complete` binds the exact journal bytes into its snapshot identity, so
 a change to the ledger between preflight and the authoritative transition is

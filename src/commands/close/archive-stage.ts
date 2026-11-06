@@ -373,11 +373,10 @@ export async function runArchiveStage(ctx: CloseStageContext): Promise<void> {
 				name !== RECEIPT_ARCHIVE_BASE_NAME && isReceiptArchiveSegmentName(name),
 		);
 		for (const artifact of receiptArchiveSegments) {
+			const srcPath = path.join(ctx.swarmDir, artifact);
+			const destPath = path.join(ctx.archiveDir, artifact);
 			try {
-				await fs.copyFile(
-					path.join(ctx.swarmDir, artifact),
-					path.join(ctx.archiveDir, artifact),
-				);
+				await fs.copyFile(srcPath, destPath);
 				ctx.archivedFileCount++;
 				ctx.archiveResults.push({
 					artifact,

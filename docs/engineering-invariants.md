@@ -299,9 +299,10 @@ Each entry below points at a release note in `docs/releases/` and the invariant(
   derive from the injected project root, reject symlink/junction/reparse
   redirection, and never follow a knowledge link, hive path, cohort store, or
   `process.cwd()`.
-- **Lifecycle and cutover:** live membership has no event-count cap. Resolved
-  pairs remain protected until durable phase closure plus the bounded
-  `knowledge.receipt_close_grace_days` interval (default seven days). Migration
+- **Lifecycle and cutover:** live membership has no event-count cap. Membership
+  (resolved or not) remains protected until its phase is durably closed plus the
+  bounded `knowledge.receipt_close_grace_days` interval (default seven days);
+  it then moves to the segmented, lossless receipt archive. Migration
   is lazy first-use work, never plugin initialization work, and imports only
   complete live records from the canonical project's local legacy log.
   Missing, evicted, linked, or malformed legacy membership is the typed

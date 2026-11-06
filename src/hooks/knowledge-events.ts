@@ -37,6 +37,7 @@ import {
 	type ReceiptMembership,
 	type ReceiptSourceCode,
 	type ReceiptTerminal,
+	readHistoricalMembershipSources,
 } from './knowledge-receipt-ledger.js';
 // Type-only import: erased at runtime, so it does NOT create a dependency that
 // would break the test-mocking pattern (see comment at L247 below). The runtime
@@ -64,6 +65,16 @@ interface CounterRollupCacheEntry {
 
 const counterRollupCache = new Map<string, CounterRollupCacheEntry>();
 const MAX_COUNTER_ROLLUP_CACHE_DIRS = 32;
+
+/**
+ * Per-entry counter contribution of ONE sealed receipt archive segment, keyed
+ * by `<canonical root>|<segment identity>`. Sealed segments are immutable and
+ * their identity (inode, size, mtime) changes if one is ever rewritten, so an
+ * entry can never go stale. Bounded FIFO/LRU: each value is only
+ * O(distinct entries in the segment).
+ */
+const sealedSegmentRollupCache = new Map<string, Map<string, CounterRollup>>();
+const MAX_SEALED_SEGMENT_ROLLUP_CACHE = 256;
 
 // ============================================================================
 // Event schema
@@ -1161,57 +1172,102 @@ export async function readKnowledgeCounterRollups(
 export async function readAuthoritativeKnowledgeCounterRollups(
 	directory: string,
 ): Promise<Map<string, CounterRollup>> {
-	const history = await queryHistoricalOutcomes(directory);
-	if (!history.ok) return new Map();
-	const rollups = new Map<string, CounterRollup>();
-	for (const membership of history.memberships) {
-		const rollup = get(rollups, membership.entry_id);
-		rollup.shown_count += 1;
-		if (membership.application_marker) {
-			rollup.acknowledged_count += 1;
-			rollup.last_acknowledged_at = maxIso(
-				rollup.last_acknowledged_at,
-				membership.application_marker.committed_at,
-			);
-		}
-		const compatible = membership as ReceiptMembership & {
-			terminal_history?: ReceiptTerminal[];
-			historical_terminals?: ReceiptTerminal[];
-		};
-		const seen = new Set<string>();
-		for (const terminal of [
-			...(compatible.terminal_history ?? []),
-			...(compatible.historical_terminals ?? []),
-			...(membership.terminal ? [membership.terminal] : []),
-		]) {
-			if (seen.has(terminal.event_id)) continue;
-			seen.add(terminal.event_id);
-			switch (terminal.outcome) {
-				case 'applied':
-					rollup.applied_explicit_count += 1;
-					rollup.last_applied_at = maxIso(
-						rollup.last_applied_at,
-						terminal.committed_at,
-					);
-					break;
-				case 'ignored':
-					rollup.ignored_count += 1;
-					break;
-				case 'violated':
-					rollup.violated_count += 1;
-					rollup.violation_timestamps.push(terminal.committed_at);
-					break;
-				case 'contradicted':
-					rollup.contradicted_count += 1;
-					break;
-				case 'n_a':
-					rollup.n_a_count += 1;
-					break;
+	const captured = await readHistoricalMembershipSources(directory);
+	if (!captured.ok) return new Map();
+	try {
+		const rollups = new Map<string, CounterRollup>();
+		// Sealed archive segments are immutable, so each one's contribution is
+		// computed once per process and reused: this runs on the per-message
+		// injection path, which must cost O(live + tail), not O(all history).
+		const rootKey = canonicalRootKey(directory);
+		for (const segment of captured.sources.sealed) {
+			const cacheKey = `${rootKey}|${segment.identity}`;
+			let contribution = sealedSegmentRollupCache.get(cacheKey);
+			if (contribution) {
+				// Refresh recency so hot segments outlive cold ones.
+				sealedSegmentRollupCache.delete(cacheKey);
+			} else {
+				contribution = new Map<string, CounterRollup>();
+				for (const membership of await segment.read()) {
+					foldMembershipIntoRollups(contribution, membership);
+				}
+			}
+			sealedSegmentRollupCache.set(cacheKey, contribution);
+			while (sealedSegmentRollupCache.size > MAX_SEALED_SEGMENT_ROLLUP_CACHE) {
+				const oldest = sealedSegmentRollupCache.keys().next().value;
+				if (oldest === undefined) break;
+				sealedSegmentRollupCache.delete(oldest);
+			}
+			for (const [entryId, rollup] of contribution) {
+				mergeRollupInto(get(rollups, entryId), rollup);
 			}
 		}
-		normalizeRollupTimestamps(rollup);
+		for (const membership of captured.sources.current) {
+			foldMembershipIntoRollups(rollups, membership);
+		}
+		return rollups;
+	} catch (err) {
+		// Same fail-open posture as an unreadable archive: no counters, never a
+		// crash on the injection path. Live receipt operations are unaffected.
+		warn(
+			`[knowledge-events] authoritative counter rollups unavailable: ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+		);
+		return new Map();
 	}
-	return rollups;
+}
+
+/** Fold ONE membership into `rollups` (the per-row body of the rollup). */
+function foldMembershipIntoRollups(
+	rollups: Map<string, CounterRollup>,
+	membership: ReceiptMembership,
+): void {
+	const rollup = get(rollups, membership.entry_id);
+	rollup.shown_count += 1;
+	if (membership.application_marker) {
+		rollup.acknowledged_count += 1;
+		rollup.last_acknowledged_at = maxIso(
+			rollup.last_acknowledged_at,
+			membership.application_marker.committed_at,
+		);
+	}
+	const compatible = membership as ReceiptMembership & {
+		terminal_history?: ReceiptTerminal[];
+		historical_terminals?: ReceiptTerminal[];
+	};
+	const seen = new Set<string>();
+	for (const terminal of [
+		...(compatible.terminal_history ?? []),
+		...(compatible.historical_terminals ?? []),
+		...(membership.terminal ? [membership.terminal] : []),
+	]) {
+		if (seen.has(terminal.event_id)) continue;
+		seen.add(terminal.event_id);
+		switch (terminal.outcome) {
+			case 'applied':
+				rollup.applied_explicit_count += 1;
+				rollup.last_applied_at = maxIso(
+					rollup.last_applied_at,
+					terminal.committed_at,
+				);
+				break;
+			case 'ignored':
+				rollup.ignored_count += 1;
+				break;
+			case 'violated':
+				rollup.violated_count += 1;
+				rollup.violation_timestamps.push(terminal.committed_at);
+				break;
+			case 'contradicted':
+				rollup.contradicted_count += 1;
+				break;
+			case 'n_a':
+				rollup.n_a_count += 1;
+				break;
+		}
+	}
+	normalizeRollupTimestamps(rollup);
 }
 
 /** Merge event-derived rollups over stored outcome counters for scoring only. */

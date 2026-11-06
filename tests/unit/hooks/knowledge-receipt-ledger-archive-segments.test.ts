@@ -192,7 +192,7 @@ describe('receipt archive segments', () => {
 		expect(history.memberships[0]?.terminal?.outcome).toBe('applied');
 	});
 
-	test('a damaged sealed segment fails history typed but never blocks the hot path', async () => {
+	test('a damaged sealed segment fails history typed but never blocks live receipt operations', async () => {
 		const directory = project('receipt-segments-sealed-corrupt-');
 		const base = Date.now();
 		_internals.maxArchiveRecords = 1;
@@ -206,7 +206,7 @@ describe('receipt archive segments', () => {
 		const history = await queryHistoricalOutcomes(directory);
 		expect(history.ok).toBe(false);
 		if (!history.ok) expect(history.code).toBe('store_corrupt');
-		// Injection, terminals, gates and compaction never read a sealed segment.
+		// Terminals, gates and compaction never read a sealed segment.
 		_internals.nowMs = () => base + 9 * DAY_MS;
 		unwrap(
 			await commitDisplayedMembership(directory, {
@@ -233,7 +233,11 @@ describe('receipt archive segments', () => {
 		unwrap(await compactKnowledgeReceiptLedger(directory));
 
 		_internals.maxArchiveHistoryBytes = 1;
-		const history = await queryHistoricalOutcomes(directory);
+		const originalWarn = console.warn;
+		console.warn = () => undefined; // the one-time budget warning is expected
+		const history = await queryHistoricalOutcomes(directory).finally(() => {
+			console.warn = originalWarn;
+		});
 		expect(history.ok).toBe(false);
 		if (!history.ok) {
 			expect(history.code).toBe('store_unavailable');
@@ -262,9 +266,10 @@ describe('receipt archive segments', () => {
 			expect(isReceiptArchiveSegmentName(decoy)).toBe(false);
 		}
 		const paths = resolveReceiptLedgerPaths(directory);
-		expect(
-			(await listReceiptArchiveSegments(paths)).map((s) => s.index),
-		).toEqual([0]);
+		const listing = await listReceiptArchiveSegments(paths);
+		expect(listing.segments.map((s) => s.index)).toEqual([0]);
+		expect(listing.highestIndex).toBe(0);
+		expect(listing.irregular).toEqual([]);
 		expect(
 			unwrap(await queryHistoricalOutcomes(directory)).memberships,
 		).toHaveLength(1);
