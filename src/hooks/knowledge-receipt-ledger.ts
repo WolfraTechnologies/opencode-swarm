@@ -1165,10 +1165,20 @@ function parseArchiveSegment(
 	return summaries;
 }
 
+/**
+ * Identity of an archived row: the membership INSTANCE, i.e. (trace, entry) plus
+ * the immutable event id assigned when it was committed. (trace, entry) alone is
+ * not enough: once a membership is archived it leaves the live state, so the
+ * same (trace, entry) can be committed again (for example by a session whose
+ * own phase lifecycle is still open). That is a new membership and must neither
+ * overwrite the archived one (losing its outcome) nor be mistaken for a copy of
+ * it. Copies of ONE membership left by an interrupted pass share the event id,
+ * so they still collapse to one row.
+ */
 function archiveKey(summary: ArchiveSummary): string {
 	return 'entry_id' in summary
-		? `membership:${keyOf(summary.trace_id, summary.entry_id)}`
-		: `empty:${emptyKeyOf(summary.trace_id, summary.session_id)}`;
+		? `membership:${keyOf(summary.trace_id, summary.entry_id)}:${summary.membership_event_id}`
+		: `empty:${emptyKeyOf(summary.trace_id, summary.session_id)}:${summary.empty_event_id}`;
 }
 
 function applyRecord(state: LedgerState, record: JournalRecord): void {
@@ -4573,11 +4583,17 @@ async function compactIfNeeded(
 	queueRecordObservations(state, checkpoint);
 }
 
-/** True while the journal still holds this archived row as live state. */
+/**
+ * True while the journal still holds THIS membership instance as live state. A
+ * live row that merely shares (trace, entry) with an archived one is a different
+ * membership and must not cause the archived instance to be purged.
+ */
 function isStillLive(state: LedgerState, row: ArchiveSummary): boolean {
 	return 'entry_id' in row
-		? state.memberships.has(keyOf(row.trace_id, row.entry_id))
-		: state.emptyTraces.has(emptyKeyOf(row.trace_id, row.session_id));
+		? state.memberships.get(keyOf(row.trace_id, row.entry_id))
+				?.membership_event_id === row.membership_event_id
+		: state.emptyTraces.get(emptyKeyOf(row.trace_id, row.session_id))
+				?.empty_event_id === row.empty_event_id;
 }
 
 /**

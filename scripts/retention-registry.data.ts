@@ -2742,7 +2742,7 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		writeLimits: {
 			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; archive is segmented: MAX_ARCHIVE_RECORDS 10000 / 16 MiB PER SEGMENT, a full tail rolls over to knowledge-receipts-v2-archive.NNNNNN.jsonl (sealed segments immutable, nothing discarded or left live); full-history read budget knowledge.receipt_archive_history_budget_mb (default 128 MiB, raise-only); grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (a phase-close/maintenance sweep also covers unresolved and other-session rows of a closed phase)',
 			scope: 'global',
-			citation: 'src/hooks/knowledge-receipt-ledger.ts:327-348,4472-4700',
+			citation: 'src/hooks/knowledge-receipt-ledger.ts:328-348,4483-4756',
 		},
 		readBound: { pattern: 'indexed', bound: 'journal ≤2000 records; compaction/terminals/gates read at most the active archive segment (≤10000 rows / 16 MiB); counter rollups cache each sealed segment by file identity (live + tail per call); full-history queries read all segments under knowledge.receipt_archive_history_budget_mb', sync: true, citation: 'src/hooks/knowledge-receipt-ledger.ts:327-343' },
 		lockModel: 'custom receipt lock with stale-owner recovery (LOCK_TIMEOUT 500 ms, uninitialized-lock reclamation 30 s)',

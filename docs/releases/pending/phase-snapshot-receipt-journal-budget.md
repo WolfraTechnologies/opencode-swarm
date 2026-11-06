@@ -38,12 +38,16 @@
   are `knowledge-receipts-v2-archive.NNNNNN.jsonl`. The highest-numbered segment is the active tail
   and the only one compaction reads or rewrites; sealed segments are immutable. The old 10,000-row /
   16 MiB bounds became per-segment append thresholds: a pass that fits the tail is appended to it,
-  otherwise the tail is sealed and the whole pass becomes one new segment. A pass is never split or
-  refused, so nothing is discarded or left live, and no migration is needed: an existing archive
-  file simply becomes the tail. Because a pass is one file, and rows still live in the journal are
-  dropped from the tail before it is sealed, a key is never written into two segments, even across
-  a crash. A row already in the tail is skipped only when identical and a changed copy replaces it,
-  which also closes a window where a terminal filed after an interrupted archive pass could be lost.
+  otherwise the tail is sealed and the whole pass becomes one new segment. A pass is never split,
+  and a full tail never causes it to be refused or its rows to stay live, so nothing is discarded
+  by capacity, and no migration is needed: an existing archive file simply becomes the tail. Archive
+  rows are identified by membership instance (trace, entry and the immutable membership event id).
+  Because a pass is one file, and instances still live in the journal are dropped from the tail
+  before it is sealed, an instance is never written into two segments, even across a crash. A row
+  already in the tail is skipped only when identical and a changed copy of the same instance
+  replaces it, which also closes a window where a terminal filed after an interrupted archive pass
+  could be lost. The same (trace, entry) committed again after its first membership was archived is
+  a new instance and is archived beside the first, so it can no longer overwrite an archived outcome.
 - **Reading history is cheap on the hot path and no longer reads sealed segments under the ledger
   lock.** The per-message counter rollups keep one cumulative rollup of all sealed segments per
   project (one entry per distinct knowledge entry, plus a short identity string per segment),
@@ -55,7 +59,8 @@
   (default `128`, raise-only, max `4096`); past it they fail typed and one critical warning is
   logged. A damaged sealed segment fails those queries with `store_corrupt` without blocking live
   operations (the rollups then read as zero, with one critical warning). A stray non-regular file
-  with a segment name, including at the base name, can no longer wedge any receipt operation.
+  with a segment name, including at the base name, can no longer wedge compaction or live receipt
+  operations; full-history queries and the counter rollups fail closed on it instead.
 - **`/swarm close` copies every archive segment** into its forensic bundle and still never removes
   them.
 

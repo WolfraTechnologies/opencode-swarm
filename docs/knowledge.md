@@ -592,22 +592,32 @@ the active tail and the only one compaction ever reads or rewrites; every lower
 segment is sealed and immutable. The old bounds (10,000 rows / 16 MiB) are now
 *per-segment append thresholds*: a pass that fits the tail is appended to it;
 otherwise the tail is sealed and the pass becomes one new segment. A pass is
-never split across files and is never refused, so an expired row never stays
-live because "the archive is full" and nothing is discarded. A pass larger than
+never split across files, and a full tail never causes it to be refused or its
+rows to stay live, so an expired row is not held back by "the archive is full"
+and nothing is discarded by capacity. A pass larger than
 the thresholds therefore produces one larger segment (bounded by the 32 MiB
 journal it came from; segments are readable up to twice that).
 
-A key is never written into two segments. Before a tail is sealed, copies of
-rows that are still live in the journal are dropped from it — those are
+An archive row is identified by its membership *instance*: (trace, entry) plus
+the immutable membership event id assigned when it was committed. A membership
+instance is never written into two segments. Before a tail is sealed, copies of
+instances that are still live in the journal are dropped from it — those are
 leftovers of an interrupted pass (archived, but the checkpoint never landed);
 the live row is authoritative and is archived again exactly once. A row already
-in the tail is skipped only if it is identical; a changed copy (a terminal
-filed after an interrupted pass archived the earlier version) replaces it. A
-crash can therefore leave a row in the journal and one archive segment, never
-in neither and never in two segments. A stray non-regular file with a segment
-name — including at the base name — never wedges compaction or any other
-receipt operation: it is neither read nor written through, new segments take the
-first free index above the tail, and full-history reads fail closed on it. A
+in the tail is skipped only if it is identical; a changed copy of the same
+instance (a terminal filed after an interrupted pass archived the earlier
+version) replaces it. A crash can therefore leave a row in the journal and one
+archive segment, never in neither and never in two segments. The same (trace,
+entry) committed again after its first membership was archived (possible while
+the committing session's own phase lifecycle is still open) is a *new*
+instance: it is archived beside the first one, never over it, and both count
+toward the rollups and history (it really was shown twice). A stray non-regular
+file with a segment name — including at the base name — never wedges compaction
+or live receipt operations: it is neither read nor written through and new
+segments take the first free index above the tail. Full-history queries and
+the counter rollups fail closed on it instead (history returns
+`store_unavailable`; rollups read as zero with one critical warning), because a
+replaced segment would silently drop history. A
 segment that was listed but has vanished before it is read also fails typed
 (`store_unavailable`) rather than reading as empty. Every pass ends with a
 coverage check that refuses to let the journal drop a row that is not provably in
@@ -623,9 +633,9 @@ What reads how much of the archive:
   project (one entry per distinct knowledge entry — not per segment — plus one
   short identity string per sealed segment), is extended when a segment seals,
   and is rebuilt only if an already-folded segment's file identity changes. The
-  ledger never writes a key into two segments, so this fold is exact; a segment
-  duplicated by hand would be counted once per copy (full-history queries
-  deduplicate by key). The first call in a process
+  ledger never writes one membership instance into two segments, so this fold
+  is exact; a segment duplicated by hand would be counted once per copy
+  (full-history queries deduplicate by instance). The first call in a process
   streams each sealed segment once; after that the cost is live + tail + a merge,
   and there is no history size limit. If the rollup cannot be built (for example
   a damaged sealed segment), counters read as zero and one critical warning is

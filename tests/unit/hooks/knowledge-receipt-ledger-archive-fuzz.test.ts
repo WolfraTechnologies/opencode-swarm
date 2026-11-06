@@ -30,7 +30,10 @@ import { createSafeTestDir } from '../../helpers/safe-test-dir.js';
  * the tail, and on a pass without the seal-time purge of still-live rows. It
  * does NOT detect a dropped "rewrite the tail when a changed row's stale copy
  * was removed" (see the deterministic safety test), nor does it exercise empty
- * traces, concurrent processes, repair, or partial files inside a write.
+ * traces, concurrent processes, repair, or partial files inside a write. It
+ * only ever uses fresh entry ids, so a (trace, entry) committed AGAIN after its
+ * first membership was archived is covered deterministically by
+ * knowledge-receipt-ledger-archive-identity.test.ts instead.
  */
 
 const DAY_MS = 86_400_000;
