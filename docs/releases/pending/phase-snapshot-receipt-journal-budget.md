@@ -44,9 +44,10 @@
   dropped from the tail before it is sealed, a key is never written into two segments, even across
   a crash. A row already in the tail is skipped only when identical and a changed copy replaces it,
   which also closes a window where a terminal filed after an interrupted archive pass could be lost.
-- **Reading history is cheap on the hot path and no longer holds the ledger lock.** The
-  per-message counter rollups keep one cumulative rollup of all sealed segments per project (sized
-  by the number of distinct knowledge entries, not by segments), extend it when a segment seals,
+- **Reading history is cheap on the hot path and no longer reads sealed segments under the ledger
+  lock.** The per-message counter rollups keep one cumulative rollup of all sealed segments per
+  project (one entry per distinct knowledge entry, plus a short identity string per segment),
+  extend it when a segment seals,
   and rebuild only if a folded segment changes, so after the first call per process they cost live +
   tail regardless of history size. Full-history queries (`queryHistoricalOutcomes`: outcome
   history, escalation windows, promotion evidence) read the tail under the lock and the sealed

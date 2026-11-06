@@ -3269,8 +3269,9 @@ export const EVIDENCE_WRITE_BLIND_SPOTS: readonly EvidenceWriteBlindSpot[] = [
 		target: 'destPath',
 		status: 'not-an-evidence-artifact',
 		reason:
-			'Two archive copies (the fixed artifact list and the dynamic ' +
-			'post-mortem/drift-report list) share this target: ' +
+			'Three archive copies (the fixed artifact list, the dynamic ' +
+			'post-mortem/drift-report list, and the numbered receipt archive ' +
+			'segments) share this target: ' +
 			'path.join(ctx.archiveDir, artifact). `ctx.archiveDir` is a member ' +
 			'expression the engine cannot fold, and it resolves to ' +
 			'.swarm/archive/swarm-<timestamp>-<suffix> — outside .swarm/evidence/.',

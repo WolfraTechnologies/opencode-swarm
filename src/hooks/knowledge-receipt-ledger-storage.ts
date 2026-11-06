@@ -158,8 +158,8 @@ export interface ReceiptArchiveListing {
 	/**
 	 * Every index whose name is in use, regular or not. A new segment takes the
 	 * first free index above the tail, so a name occupied by something
-	 * irregular is never reused or written through (and an irregular entry
-	 * parked at the very top of the index space cannot exhaust allocation).
+	 * irregular is never reused or written through. Allocation only fails if
+	 * the whole index space above the tail (up to 999999) is in use.
 	 */
 	occupied: Set<number>;
 	/** Matching names that are not regular files (symlink, directory, ...). */

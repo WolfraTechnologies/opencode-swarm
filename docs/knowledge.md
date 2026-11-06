@@ -607,7 +607,11 @@ crash can therefore leave a row in the journal and one archive segment, never
 in neither and never in two segments. A stray non-regular file with a segment
 name — including at the base name — never wedges compaction or any other
 receipt operation: it is neither read nor written through, new segments take the
-first free index above the tail, and full-history reads fail closed on it.
+first free index above the tail, and full-history reads fail closed on it. A
+segment that was listed but has vanished before it is read also fails typed
+(`store_unavailable`) rather than reading as empty. Every pass ends with a
+coverage check that refuses to let the journal drop a row that is not provably in
+an archive file. The index space is 000001–999999; exhausting it fails typed.
 
 What reads how much of the archive:
 
@@ -616,9 +620,12 @@ What reads how much of the archive:
 - **Counter rollups** (`readAuthoritativeKnowledgeCounterRollups`, on the
   per-message injection path) fold the live rows and the tail onto a cached
   *cumulative* rollup of all sealed segments. The cache holds one aggregate per
-  project (size bounded by the number of distinct knowledge entries, not by the
-  number of segments), is extended when a segment seals, and is rebuilt only if
-  an already-folded segment's file identity changes. The first call in a process
+  project (one entry per distinct knowledge entry — not per segment — plus one
+  short identity string per sealed segment), is extended when a segment seals,
+  and is rebuilt only if an already-folded segment's file identity changes. The
+  ledger never writes a key into two segments, so this fold is exact; a segment
+  duplicated by hand would be counted once per copy (full-history queries
+  deduplicate by key). The first call in a process
   streams each sealed segment once; after that the cost is live + tail + a merge,
   and there is no history size limit. If the rollup cannot be built (for example
   a damaged sealed segment), counters read as zero and one critical warning is

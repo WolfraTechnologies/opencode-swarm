@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { basename } from 'node:path';
 import { loadPluginConfigWithMeta } from '../config/index.js';
 import {
 	KnowledgeConfigSchema,
@@ -4048,7 +4049,7 @@ async function captureHistory(
 	const tail = listing.segments.at(-1);
 	const tailRows = tail
 		? parseArchiveSegment(
-				await _internals.readArchiveSegmentFile(tail.filePath),
+				await readListedSegment(tail),
 				ARCHIVE_INVALID_AUTHORITATIVE,
 			)
 		: [];
@@ -4117,7 +4118,7 @@ export async function queryHistoricalOutcomes(
 		for (const segment of captured.sealed) {
 			absorb(
 				parseArchiveSegment(
-					await _internals.readArchiveSegmentFile(segment.filePath),
+					await readListedSegment(segment),
 					ARCHIVE_INVALID_AUTHORITATIVE,
 				),
 			);
@@ -4176,7 +4177,7 @@ export async function readHistoricalMembershipSources(
 				identity: segment.identity,
 				read: async () =>
 					parseArchiveSegment(
-						await _internals.readArchiveSegmentFile(segment.filePath),
+						await readListedSegment(segment),
 						ARCHIVE_INVALID_AUTHORITATIVE,
 					).filter(
 						(summary): summary is ReceiptMembership => 'entry_id' in summary,
@@ -4598,6 +4599,12 @@ function isStillLive(state: LedgerState, row: ArchiveSummary): boolean {
  * neither. A row already in the tail is skipped only when identical; a changed
  * copy (a terminal filed after an interrupted pass archived the earlier
  * version) replaces it, so a retry can never lose the newer state.
+ *
+ * The seal-time purge is the dangerous step: the rows of THIS pass are live
+ * too, so an identical copy kept in the tail would be purged with the rest.
+ * Those rows are therefore re-placed into the new segment, and a closing
+ * coverage check refuses to return unless every pending row is provably in an
+ * archive file — the caller deletes them from the journal right after.
  */
 async function archiveSummaries(
 	paths: ReceiptLedgerPaths,
@@ -4609,8 +4616,9 @@ async function archiveSummaries(
 	// is never read, written through, or reused — a new segment takes the first
 	// free index above the tail. History reads still fail closed on it.
 	const listing = await listReceiptArchiveSegments(paths);
+	const listedTail = listing.segments.at(-1);
 	const tail =
-		listing.segments.at(-1) ??
+		listedTail ??
 		(listing.irregular.includes(RECEIPT_ARCHIVE_BASE_NAME)
 			? undefined
 			: { index: 0, filePath: paths.archive });
@@ -4619,8 +4627,13 @@ async function archiveSummaries(
 	const tailRows = new Map<string, ArchiveSummary>();
 	let tailBytes = 0;
 	if (tail) {
+		// A tail that was listed must still exist; only the not-yet-created base
+		// file may be absent.
+		const raw = listedTail
+			? await readListedSegment(listedTail)
+			: await _internals.readArchiveSegmentFile(tail.filePath);
 		for (const row of parseArchiveSegment(
-			await _internals.readArchiveSegmentFile(tail.filePath),
+			raw,
 			'receipt archive contains an invalid summary',
 		)) {
 			const key = archiveKey(row);
@@ -4630,18 +4643,40 @@ async function archiveSummaries(
 			tailBytes += lineBytes(row);
 		}
 	}
+	const kept: ArchiveSummary[] = [];
 	const placing: ArchiveSummary[] = [];
-	let tailDirty = false;
 	for (const summary of summaries) {
 		const key = archiveKey(summary);
 		const prior = tailRows.get(key);
 		if (prior !== undefined) {
-			if (stableJson(prior) === stableJson(summary)) continue;
+			if (stableJson(prior) === stableJson(summary)) {
+				kept.push(summary);
+				continue;
+			}
 			tailRows.delete(key);
 			tailBytes -= lineBytes(prior);
-			tailDirty = true;
 		}
 		placing.push(summary);
+	}
+	/** Refuse to let the caller delete a row that is not provably archived. */
+	const assertCovered = (...covered: Array<Iterable<string>>): void => {
+		const keys = new Set(covered.flatMap((part) => [...part]));
+		const missing = summaries.filter(
+			(summary) => !keys.has(archiveKey(summary)),
+		);
+		if (missing.length > 0) {
+			throw new ReceiptStoreError(
+				'store_unavailable',
+				`receipt archive pass left ${missing.length} pending row(s) unarchived; refusing to remove them from the journal`,
+			);
+		}
+	};
+	if (placing.length === 0) {
+		// Everything is already archived verbatim in the tail (a retry after an
+		// interrupted pass). Write nothing and do not seal: a retry must not
+		// churn or empty a large tail.
+		assertCovered(tailRows.keys());
+		return;
 	}
 	const placingBytes = placing.reduce((sum, row) => sum + lineBytes(row), 0);
 	const appendsToTail =
@@ -4650,30 +4685,39 @@ async function archiveSummaries(
 			(tailRows.size + placing.length <= _internals.maxArchiveRecords &&
 				tailBytes + placingBytes <= _internals.maxArchiveBytes));
 	if (tail && appendsToTail) {
-		if (placing.length === 0 && !tailDirty) return;
 		for (const row of placing) tailRows.set(archiveKey(row), row);
 		await _internals.atomicWriteFsynced(
 			tail.filePath,
 			serializeArchive([...tailRows.values()]),
 		);
+		assertCovered(tailRows.keys());
 		return;
 	}
+	let moved = placing;
 	if (tail) {
-		// About to seal the tail: drop its copies of rows that are still live.
+		// About to seal the tail: drop its copies of rows that are still live
+		// (leftovers of an interrupted pass). Rows of THIS pass that were kept as
+		// identical are live too, so their tail copies go with them and they are
+		// re-placed below. Written BEFORE the new segment, so a crash between the
+		// two leaves every dropped row live in the journal and in no segment.
+		const purged = new Set<string>();
 		for (const [key, row] of tailRows) {
 			if (isStillLive(state, row)) {
 				tailRows.delete(key);
-				tailDirty = true;
+				purged.add(key);
 			}
 		}
-		if (tailDirty) {
+		moved = [
+			...placing,
+			...kept.filter((summary) => purged.has(archiveKey(summary))),
+		];
+		if (purged.size > 0) {
 			await _internals.atomicWriteFsynced(
 				tail.filePath,
 				serializeArchive([...tailRows.values()]),
 			);
 		}
 	}
-	if (placing.length === 0) return;
 	let index = (tail?.index ?? 0) + 1;
 	while (listing.occupied.has(index)) index += 1;
 	if (index > MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX) {
@@ -4684,8 +4728,27 @@ async function archiveSummaries(
 	}
 	await _internals.atomicWriteFsynced(
 		receiptArchiveSegmentPath(paths, index),
-		serializeArchive(placing),
+		serializeArchive(moved),
 	);
+	assertCovered(tailRows.keys(), moved.map(archiveKey));
+}
+
+/**
+ * Read a segment that was just listed. A listed segment that has vanished
+ * (manual deletion, or a concurrent removal) must fail typed: treating it as
+ * empty would silently drop history.
+ */
+async function readListedSegment(
+	segment: ReceiptArchiveSegment,
+): Promise<string> {
+	const raw = await _internals.readArchiveSegmentFile(segment.filePath);
+	if (raw === null) {
+		throw new ReceiptStoreError(
+			'store_unavailable',
+			`receipt archive segment disappeared: ${basename(segment.filePath)}`,
+		);
+	}
+	return raw;
 }
 
 function serializeArchive(summaries: ArchiveSummary[]): string {

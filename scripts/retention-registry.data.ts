@@ -2736,7 +2736,7 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		stateClass: 'authoritative',
 		privacyClass: 'metadata',
 		directFileExemption: {
-			reason: 'The #2031 authoritative correctness ledger: fsynced append with dev/ino identity checks, quarantine-on-corruption, and phase-close+grace compaction under a custom stale-recovering lock — journal ≤2000 records, archive in bounded immutable segments (≤10000 rows each); a swarm.db table cannot reproduce the same one-process lock/quarantine discipline.',
+			reason: 'The #2031 authoritative correctness ledger: fsynced append with dev/ino identity checks, quarantine-on-corruption, and phase-close+grace compaction under a custom stale-recovering lock — journal ≤2000 records, archive in immutable segments (10000-row append threshold per segment; one pass is never split); a swarm.db table cannot reproduce the same one-process lock/quarantine discipline.',
 			reviewedIssue: 2031,
 		},
 		writeLimits: {
