@@ -18,9 +18,11 @@
   budget for the remaining snapshot inputs (`.swarm/evidence/`, `.swarm/spec.md`, `specs/`,
   `openspec/`). The snapshot is computed several times per completion and hashed synchronously, so
   raise it only as far as the evidence set needs.
-- **`PHASE_SNAPSHOT_BYTE_LIMIT` now says what overflowed.** The error names the file that crossed
-  the budget, the observed total, the configured limit, the bytes per input, and the config key to
-  raise.
+- **`PHASE_SNAPSHOT_BYTE_LIMIT` now says what overflowed.** When the aggregate evidence snapshot
+  crosses `phase_complete.snapshot_max_bytes`, the error names the observed total, the configured
+  limit, the bytes per input so far, and that config key. A receipt journal over its own 32 MiB
+  limit is reported as that file and its size instead: the receipt store enforces the same limit, so
+  there is nothing to raise.
 - **Receipts of closed phases are now garbage-collected after the grace period even without a
   terminal receipt.** Closing a phase only stamped the closing session's own memberships, and
   compaction only archived *resolved* ones, so exposures from delegate lanes and earlier sessions

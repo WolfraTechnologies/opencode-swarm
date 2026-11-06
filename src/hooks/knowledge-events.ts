@@ -1184,8 +1184,10 @@ export async function readAuthoritativeKnowledgeCounterRollups(
 	if (!captured.ok) return new Map();
 	const rootKey = canonicalRootKey(directory);
 	try {
-		// Sealed archive segments are immutable and the write path never puts one
-		// key in two segments, so their contribution is computed ONCE per process
+		// Sealed archive segments are immutable and no archive pass or crash puts
+		// one membership instance in two segments (only a journal repair that
+		// resurrects a checkpointed-away instance can, and it is then counted once
+		// per copy), so their contribution is computed ONCE per process
 		// (and only the newly sealed ones thereafter): this runs on the
 		// per-message injection path, which must cost O(live + tail), not
 		// O(all history). The first call in a process streams each sealed segment

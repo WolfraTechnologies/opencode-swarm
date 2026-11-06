@@ -632,7 +632,10 @@ an archive file. The index space is 000001–999999; exhausting it fails typed.
 What reads how much of the archive:
 
 - **Compaction, terminals, gates, injection bookkeeping** read at most the
-  active tail (≤16 MiB in normal operation), plus a directory listing.
+  active tail, plus a directory listing. The tail stays near the 16 MiB append
+  threshold, but because a pass is never split, a single large pass can leave a
+  larger one (up to the 32 MiB journal it came from; segments are readable up to
+  twice that).
 - **Counter rollups** (`readAuthoritativeKnowledgeCounterRollups`, on the
   per-message injection path) fold the live rows and the tail onto a cached
   *cumulative* rollup of all sealed segments. The cache holds one aggregate per
@@ -640,8 +643,9 @@ What reads how much of the archive:
   short identity string per sealed segment), is extended when a segment seals,
   and is rebuilt only if an already-folded segment's file identity changes. The
   ledger never writes one membership instance into two segments, so this fold
-  is exact; a segment duplicated by hand would be counted once per copy
-  (full-history queries deduplicate by instance). The first call in a process
+  is exact; an instance a journal repair re-archived, or a segment duplicated by
+  hand, is counted once per copy (full-history queries deduplicate by
+  instance). The first call in a process
   streams each sealed segment once; after that the cost is live + tail + a merge,
   and there is no history size limit. If the rollup cannot be built (for example
   a damaged sealed segment), counters read as zero and one critical warning is

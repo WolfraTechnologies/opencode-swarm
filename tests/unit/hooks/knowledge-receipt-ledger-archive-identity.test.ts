@@ -5,6 +5,7 @@ import { readAuthoritativeKnowledgeCounterRollups } from '../../../src/hooks/kno
 import {
 	_internals,
 	commitDisplayedMembership,
+	commitEmptyRetrieval,
 	commitPhaseClosed,
 	queryHistoricalOutcomes,
 	queryLiveMemberships,
@@ -44,6 +45,26 @@ function project(prefix: string): string {
 function unwrap<T>(result: ReceiptLedgerResult<T>): T {
 	if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
 	return result;
+}
+
+/** Every archived row, tagged with the segment file it sits in. */
+function archivedRows(
+	directory: string,
+): Array<Record<string, unknown> & { file: string }> {
+	const swarm = path.join(directory, '.swarm');
+	return fs
+		.readdirSync(swarm)
+		.filter((name) => isReceiptArchiveSegmentName(name))
+		.flatMap((name) =>
+			fs
+				.readFileSync(path.join(swarm, name), 'utf8')
+				.split('\n')
+				.filter(Boolean)
+				.map((line) => ({
+					...(JSON.parse(line) as Record<string, unknown>),
+					file: name,
+				})),
+		);
 }
 
 /** Event ids of every archived row of `entryId`, per segment file. */
@@ -184,6 +205,52 @@ describe('a re-created (trace, entry) is a new membership, never an overwrite or
 		).get('e1');
 		expect(rollup?.shown_count).toBe(2);
 		expect(rollup?.applied_explicit_count).toBe(1);
+	});
+
+	test('empty-trace instances follow the same rules: a re-committed (trace, session) never costs the archived one', async () => {
+		// Empty traces are archived under their own key shape
+		// (trace, session, empty event id). Same hazard, same guard.
+		const directory = project('receipt-archive-identity-empty-');
+		let clock = Date.now();
+		_internals.nowMs = () => clock;
+		_internals.maxArchiveRecords = 1;
+		const commitEmpty = async (): Promise<string> => {
+			const result = await commitEmptyRetrieval(directory, {
+				trace_id: 'trace-empty',
+				session_id: 'SA',
+				phase: 'Phase 1',
+				grace_days: 0,
+			});
+			if (!result.ok) throw new Error(`${result.code}: ${result.detail}`);
+			return result.event_id;
+		};
+		/** `file#empty_event_id` of every archived empty-trace row. */
+		const archivedEmpties = (): string[] =>
+			archivedRows(directory)
+				.filter((row) => row.summary_kind === 'empty_trace')
+				.map((row) => `${row.file}#${row.empty_event_id}`);
+
+		const first = await commitEmpty();
+		clock += 1000;
+		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'SA'));
+		expect(archivedEmpties()).toHaveLength(1);
+		expect(archivedEmpties()[0]).toContain(`#${first}`);
+
+		// The same (trace, session) is committed again: a new live instance.
+		clock += 1000;
+		const second = await commitEmpty();
+		expect(second).not.toBe(first);
+		// An unrelated expired row forces a pass that must SEAL segment 0.
+		clock += 1000;
+		await expose(directory, 'S2', 'Phase 2', 'e2', 'trace-other');
+		clock += 1000;
+		unwrap(await commitPhaseClosed(directory, 'Phase 2', 'S2'));
+
+		// The archived empty instance survived the seal; the new one is live
+		// (committing again is idempotent and returns its id, not a third one).
+		expect(archivedEmpties()).toHaveLength(1);
+		expect(archivedEmpties()[0]).toContain(`#${first}`);
+		expect(await commitEmpty()).toBe(second);
 	});
 
 	test('a re-created membership is counted once per instance even when the first one is sealed', async () => {
