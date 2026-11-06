@@ -514,9 +514,9 @@ export async function buildVerificationReceipt(
 		}
 		const hashed = hashReceiptArtifact(root, path.join(root, relative));
 		totalArtifactBytes += hashed.ref.bytes;
-		// Aggregate cap mirrors computePhaseEvidenceSnapshot's totalBytes
-		// accumulation (implementation-review F5): the 16 MiB bound is a
-		// per-RECEIPT hashing budget, not just a per-file one.
+		// Aggregate cap mirrors computePhaseEvidenceSnapshot's evidence-class
+		// byte budget (DEFAULT_SNAPSHOT_MAX_BYTES; implementation-review F5): the
+		// 16 MiB bound is a per-RECEIPT hashing budget, not just a per-file one.
 		if (totalArtifactBytes > MAX_RECEIPT_ARTIFACT_BYTES) {
 			throw new Error(
 				`RECEIPT_ARTIFACT_BYTE_LIMIT: aggregate ${totalArtifactBytes} over ${id}`,

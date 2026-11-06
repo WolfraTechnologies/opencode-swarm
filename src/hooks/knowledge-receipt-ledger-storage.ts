@@ -16,6 +16,13 @@ import { validateSwarmPath } from './utils.js';
 
 export const RECEIPT_SCHEMA_VERSION = 2;
 export const RECEIPT_CUTOVER_VERSION = 1;
+/**
+ * Largest authoritative receipt journal the store will read. Single source for
+ * the ledger reader and for the phase-complete snapshot identity, which hashes
+ * the journal under this same bound (it must never be stricter than the
+ * reader, or a journal the store still accepts would wedge `phase_complete`).
+ */
+export const MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES = 32 * 1024 * 1024;
 const LOCK_RETRY_MS = 25;
 const LOCK_TIMEOUT_MS = 500;
 // One elapsed deadline covers stale-owner inspection, bounded Linux zombie
@@ -462,7 +469,7 @@ export function receiptRecordHash(value: unknown): string {
 
 export async function readUtf8IfPresent(
 	filePath: string,
-	maxBytes = 32 * 1024 * 1024,
+	maxBytes = MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES,
 ): Promise<string | null> {
 	const bytes = await readBytesIfPresent(filePath, maxBytes);
 	return bytes === null ? null : bytes.toString('utf8');
@@ -471,7 +478,7 @@ export async function readUtf8IfPresent(
 /** Read an authoritative receipt artifact without lossy text decoding. */
 export async function readBytesIfPresent(
 	filePath: string,
-	maxBytes = 32 * 1024 * 1024,
+	maxBytes = MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES,
 ): Promise<Buffer | null> {
 	let handle: Awaited<ReturnType<typeof open>> | undefined;
 	try {

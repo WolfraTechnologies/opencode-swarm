@@ -549,10 +549,57 @@ never rewrites a stored label.
 
 The journal never evicts live membership because of an event-count cap. Its
 2,000-record threshold triggers a self-contained checkpoint rewrite; it is not
-a retention limit. Resolved state remains protected until its phase is durably closed and
+a retention limit. Every membership — resolved or still unresolved — remains
+protected until its phase is durably closed and
 `knowledge.receipt_close_grace_days` has elapsed. Eligible closed summaries move
-to the separate project-local receipt archive; a bounded audit tail and a
+to the separate project-local receipt archive (the full row is kept, so outcome
+and shown-count rollups are unchanged); a bounded audit tail and a
 rebuildable snapshot do not share the diagnostic event budget.
+
+A membership counts as closed when the session/task that closed the phase
+stamped it, **or** when a durably closed lifecycle for the same stable phase
+identity (the explicit or label-parsed `phase_id`; the verbatim label only for
+labels that carry no id) records a close at or after the moment the membership
+was committed. Closing a phase only stamps the closing session's own
+memberships, so without the lifecycle rule exposures from delegate lanes and
+earlier sessions of the same phase would never age out. The "at or after its
+commit" ordering is load-bearing: `/swarm close` keeps the receipt ledger and a
+later plan restarts at phase 1, so a close recorded for an earlier plan's phase
+1 must never expire the new plan's still-open phase-1 exposures — they stay
+live until a close that actually follows them. The same rule keeps an exposure
+that a stale phase cursor labelled with a long-closed phase live.
+
+The expiry of rows that no stamp reached (unresolved exposures and other
+sessions' rows) is a sweep: it runs when a phase is closed and whenever the
+2,000-record threshold already forces a checkpoint rewrite (the exported
+`compactKnowledgeReceiptLedger` maintenance entry point sweeps too) — never on
+every receipt operation, so steady-state cost is unchanged. Resolved rows are
+offered to the archive before unresolved ones. A terminal filed for a
+membership that has already been archived is rejected as an unknown
+trace/entry, exactly like a terminal for any other archived membership.
+
+Two cases keep rows live by design, because no close instant exists for them:
+rows of a phase that is never closed (an abandoned plan's open phase), and
+rows of a later plan that reuses a phase id when the same session that closed
+that id earlier closes it again — the ledger deduplicates a repeated close for
+the same session and phase id, so it records no new close instant for other
+sessions' rows. Both are the pre-existing behaviour, not a regression.
+
+The archive keeps its existing capacity bounds (`MAX_ARCHIVE_RECORDS` rows /
+16 MiB). When it is full the overflow stays live in the journal — capacity
+pressure never discards prior authority — so a journal can still grow toward
+the 32 MiB read limit if closed-phase exposures arrive faster than the archive
+can hold them. Beyond that limit the receipt store reports `store_corrupt` for
+every operation.
+
+`phase_complete` binds the exact journal bytes into its snapshot identity, so
+a change to the ledger between preflight and the authoritative transition is
+detected. The journal is hashed in bounded chunks under its own limit — the
+receipt store's 32 MiB journal read limit — and does **not** count against the
+`phase_complete.snapshot_max_bytes` evidence budget, so a long, delegation-heavy
+phase cannot make `phase_complete` fail with `PHASE_SNAPSHOT_BYTE_LIMIT` while
+the receipt store can still read the journal. The exemption applies only to the
+regular file at `.swarm/knowledge-receipts-v2.jsonl`.
 
 #### Receipt-ledger recovery
 

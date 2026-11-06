@@ -1159,7 +1159,9 @@ export async function executePhaseComplete(
 			const policyHash = createHash('sha256')
 				.update(JSON.stringify(config))
 				.digest('hex');
-			const evidenceHash = computePhaseEvidenceSnapshot(dir);
+			const evidenceHash = computePhaseEvidenceSnapshot(dir, {
+				maxBytes: phaseCompleteConfig.snapshot_max_bytes,
+			});
 			return passGate({
 				evidenceRefs: [
 					`plan-structure:${structureHash}`,
@@ -1422,8 +1424,9 @@ export async function executePhaseComplete(
 								.update(JSON.stringify(loadPluginConfigWithMeta(dir).config))
 								.digest('hex');
 							if (
-								computePhaseEvidenceSnapshot(dir) !==
-									expectedCommitEvidenceHash ||
+								computePhaseEvidenceSnapshot(dir, {
+									maxBytes: phaseCompleteConfig.snapshot_max_bytes,
+								}) !== expectedCommitEvidenceHash ||
 								currentPolicyHash !== expectedCommitPolicyHash
 							) {
 								throw new Error(

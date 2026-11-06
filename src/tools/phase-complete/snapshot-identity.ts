@@ -1,19 +1,45 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES } from '../../hooks/knowledge-receipt-ledger-storage.js';
 
 const MAX_SNAPSHOT_FILES = 512;
 const MAX_SNAPSHOT_ENTRIES = 2_048;
-const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+const HASH_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Default byte budget for the evidence-class snapshot inputs. Operators can
+ * raise or lower it with `phase_complete.snapshot_max_bytes`; the schema's
+ * default literal is pinned to this constant by a unit test.
+ */
+export const DEFAULT_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The receipt journal is project state, not task evidence: it grows with
+ * every knowledge exposure, independently of how much evidence a phase
+ * produced. It is therefore hashed in full (identity stays byte-exact) under
+ * its OWN bound — the journal reader's cap — instead of competing with the
+ * evidence budget. A journal the receipt store can still read can never wedge
+ * `phase_complete`, and the two limits cannot disagree.
+ */
+const RECEIPT_LEDGER_INPUT = '.swarm/knowledge-receipts-v2.jsonl';
 
 const INPUTS = [
 	'.swarm/evidence',
 	'.swarm/spec.md',
-	'.swarm/knowledge-receipts-v2.jsonl',
+	RECEIPT_LEDGER_INPUT,
 	'specs',
 	'openspec/specs',
 	'openspec/changes',
 ] as const;
+
+export interface PhaseEvidenceSnapshotOptions {
+	/**
+	 * Byte budget for every input except the receipt journal. Defaults to
+	 * {@link DEFAULT_SNAPSHOT_MAX_BYTES}.
+	 */
+	maxBytes?: number;
+}
 
 interface SnapshotEntry {
 	path: string;
@@ -67,14 +93,97 @@ export function toPortableRelativePath(root: string, absolute: string): string {
  */
 export const SNAPSHOT_EXCLUDED_EVIDENCE_ENTRIES = new Set(['receipts']);
 
-export function computePhaseEvidenceSnapshot(directory: string): string {
+/**
+ * SHA-256 of a file's exact bytes, read in bounded chunks so the memory
+ * footprint is independent of file size. The descriptor is re-validated
+ * against the lstat the caller already took (identity + size) and against
+ * itself after the read (size + mtime + ctime), so a concurrent writer is a
+ * hard failure, never a torn digest.
+ */
+function hashRegularFile(
+	absolute: string,
+	stat: fs.Stats,
+): { sha256: string; bytes: number } {
+	const descriptor = fs.openSync(
+		absolute,
+		fs.constants.O_RDONLY |
+			((fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0),
+	);
+	try {
+		const opened = fs.fstatSync(descriptor);
+		if (
+			!opened.isFile() ||
+			opened.dev !== stat.dev ||
+			opened.ino !== stat.ino ||
+			opened.size !== stat.size
+		) {
+			throw new Error('PHASE_SNAPSHOT_CONCURRENT_MUTATION');
+		}
+		const hash = createHash('sha256');
+		const chunk = Buffer.allocUnsafe(Math.min(HASH_CHUNK_BYTES, opened.size));
+		let consumed = 0;
+		while (consumed < opened.size) {
+			const read = fs.readSync(
+				descriptor,
+				chunk,
+				0,
+				Math.min(chunk.length, opened.size - consumed),
+				consumed,
+			);
+			if (read === 0) throw new Error('PHASE_SNAPSHOT_CONCURRENT_MUTATION');
+			hash.update(chunk.subarray(0, read));
+			consumed += read;
+		}
+		const after = fs.fstatSync(descriptor);
+		if (
+			after.size !== opened.size ||
+			after.mtimeMs !== opened.mtimeMs ||
+			after.ctimeMs !== opened.ctimeMs
+		) {
+			throw new Error('PHASE_SNAPSHOT_CONCURRENT_MUTATION');
+		}
+		return { sha256: hash.digest('hex'), bytes: consumed };
+	} finally {
+		fs.closeSync(descriptor);
+	}
+}
+
+export function computePhaseEvidenceSnapshot(
+	directory: string,
+	options: PhaseEvidenceSnapshotOptions = {},
+): string {
+	const maxBytes = options.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES;
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+		throw new Error('PHASE_SNAPSHOT_INVALID_LIMIT');
+	}
 	const root = fs.realpathSync(directory);
 	const evidenceRoot = path.join(root, '.swarm', 'evidence');
 	const entries: SnapshotEntry[] = [];
-	let totalBytes = 0;
+	// Evidence-class bytes (everything but the receipt journal), tracked per
+	// top-level input so a limit failure can name where the budget went.
+	const bytesByInput = new Map<string, number>();
+	let evidenceBytes = 0;
 	let visitedEntries = 0;
 
-	const visit = (absolute: string): void => {
+	const byteLimitError = (
+		relativePath: string,
+		isJournal: boolean,
+		fileBytes: number,
+	): Error => {
+		if (isJournal) {
+			return new Error(
+				`PHASE_SNAPSHOT_BYTE_LIMIT: ${relativePath} is ${fileBytes} bytes, over the ${MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES}-byte receipt journal limit that the receipt store itself also enforces`,
+			);
+		}
+		const breakdown = [...bytesByInput]
+			.map(([name, bytes]) => `${name}=${bytes}`)
+			.join(', ');
+		return new Error(
+			`PHASE_SNAPSHOT_BYTE_LIMIT: hashing ${relativePath} brought the phase evidence snapshot to ${evidenceBytes} bytes, over the ${maxBytes}-byte limit (bytes per input so far: ${breakdown}); raise phase_complete.snapshot_max_bytes or prune the largest input`,
+		);
+	};
+
+	const visit = (absolute: string, input: string): void => {
 		if (!isContained(root, absolute)) {
 			throw new Error('PHASE_SNAPSHOT_PATH_ESCAPE');
 		}
@@ -111,7 +220,7 @@ export function computePhaseEvidenceSnapshot(directory: string): string {
 				if (isEvidenceRoot && SNAPSHOT_EXCLUDED_EVIDENCE_ENTRIES.has(name)) {
 					continue;
 				}
-				visit(path.join(absolute, name));
+				visit(path.join(absolute, name), input);
 			}
 			return;
 		}
@@ -123,45 +232,33 @@ export function computePhaseEvidenceSnapshot(directory: string): string {
 		if (entries.length >= MAX_SNAPSHOT_FILES) {
 			throw new Error('PHASE_SNAPSHOT_FILE_LIMIT');
 		}
-		totalBytes += stat.size;
-		if (totalBytes > MAX_SNAPSHOT_BYTES) {
-			throw new Error('PHASE_SNAPSHOT_BYTE_LIMIT');
-		}
-		const descriptor = fs.openSync(
-			absolute,
-			fs.constants.O_RDONLY |
-				((fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0),
-		);
-		try {
-			const opened = fs.fstatSync(descriptor);
-			if (
-				!opened.isFile() ||
-				opened.dev !== stat.dev ||
-				opened.ino !== stat.ino ||
-				opened.size !== stat.size
-			) {
-				throw new Error('PHASE_SNAPSHOT_CONCURRENT_MUTATION');
+		const relativePath = toPortableRelativePath(root, absolute);
+		// The journal exemption is keyed on the exact regular file at the ledger
+		// path, never on the input label: a directory that merely carries the
+		// ledger's name must not turn everything inside it into exempt bytes.
+		const isJournal = relativePath === RECEIPT_LEDGER_INPUT;
+		if (isJournal) {
+			if (stat.size > MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES) {
+				throw byteLimitError(relativePath, true, stat.size);
 			}
-			const bytes = fs.readFileSync(descriptor);
-			const after = fs.fstatSync(descriptor);
-			if (
-				after.size !== opened.size ||
-				after.mtimeMs !== opened.mtimeMs ||
-				after.ctimeMs !== opened.ctimeMs
-			) {
-				throw new Error('PHASE_SNAPSHOT_CONCURRENT_MUTATION');
+		} else {
+			evidenceBytes += stat.size;
+			bytesByInput.set(input, (bytesByInput.get(input) ?? 0) + stat.size);
+			if (evidenceBytes > maxBytes) {
+				throw byteLimitError(relativePath, false, stat.size);
 			}
-			entries.push({
-				path: toPortableRelativePath(root, absolute),
-				sha256: createHash('sha256').update(bytes).digest('hex'),
-				bytes: bytes.byteLength,
-			});
-		} finally {
-			fs.closeSync(descriptor);
 		}
+		const hashed = hashRegularFile(absolute, stat);
+		entries.push({
+			path: relativePath,
+			sha256: hashed.sha256,
+			bytes: hashed.bytes,
+		});
 	};
 
-	for (const relative of INPUTS) visit(path.join(root, ...relative.split('/')));
+	for (const relative of INPUTS) {
+		visit(path.join(root, ...relative.split('/')), relative);
+	}
 	entries.sort((left, right) => compareUtf8(left.path, right.path));
 	return createHash('sha256')
 		.update(JSON.stringify({ schemaVersion: 1, entries }))

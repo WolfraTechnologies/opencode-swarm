@@ -2740,7 +2740,7 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 			reviewedIssue: 2031,
 		},
 		writeLimits: {
-			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; MAX_ARCHIVE_RECORDS 10000 / 16 MiB; grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (capacity pressure retains live :2909-2927)',
+			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; MAX_ARCHIVE_RECORDS 10000 / 16 MiB; grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (resolved rows first; a phase-close/maintenance sweep also covers unresolved and other-session rows of a closed phase; capacity pressure retains live :2909-2927)',
 			scope: 'global',
 			citation: 'src/hooks/knowledge-receipt-ledger.ts:255-261,2863-2959',
 		},

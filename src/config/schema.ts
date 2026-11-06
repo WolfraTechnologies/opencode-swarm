@@ -566,6 +566,17 @@ export const PhaseCompleteConfigSchema = z.object({
 		.default(['coder', 'reviewer', 'test_engineer']),
 	require_docs: z.boolean().default(true),
 	policy: z.enum(['enforce', 'warn']).default('enforce'),
+	/**
+	 * Byte budget for the phase evidence snapshot identity (`.swarm/evidence`,
+	 * `.swarm/spec.md`, `specs/`, `openspec/`). The receipt journal is hashed
+	 * under its own bound and does not count against this budget.
+	 */
+	snapshot_max_bytes: z
+		.number()
+		.int()
+		.min(1_048_576)
+		.max(268_435_456)
+		.default(16 * 1024 * 1024),
 	regression_sweep: z
 		.object({
 			enforce: z.boolean().default(false),

@@ -237,6 +237,12 @@
             "warn"
           ]
         },
+        "snapshot_max_bytes": {
+          "default": 16777216,
+          "type": "integer",
+          "minimum": 1048576,
+          "maximum": 268435456
+        },
         "regression_sweep": {
           "type": "object",
           "properties": {

@@ -11,6 +11,7 @@ import { extractPhaseIdFromLabel } from './extractors.js';
 import {
 	appendFsynced,
 	atomicWriteFsynced,
+	MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES,
 	RECEIPT_CUTOVER_VERSION,
 	RECEIPT_SCHEMA_VERSION,
 	type ReceiptLedgerPaths,
@@ -317,7 +318,7 @@ export type CommitEmptyRetrievalResult =
 const GENESIS_HASH = 'GENESIS';
 const MAX_JOURNAL_RECORDS = 2_000;
 const MAX_AUDIT_TAIL_RECORDS = 256;
-const MAX_JOURNAL_BYTES = 32 * 1024 * 1024;
+const MAX_JOURNAL_BYTES = MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES;
 const MAX_ARCHIVE_RECORDS = 10_000;
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
 const MAX_LEGACY_BYTES = 32 * 1024 * 1024;
@@ -2418,7 +2419,7 @@ async function runLocked<T>(
 		state: LedgerState,
 		resolvedGraceDays: number,
 	) => Promise<T>,
-	options: { compact?: boolean; writeSnapshot?: boolean } = {},
+	options: { compact?: boolean; writeSnapshot?: boolean; sweep?: boolean } = {},
 ): Promise<ReceiptLedgerResult<T>> {
 	const observations: KnowledgeReceiptTransitionObservation[] = [];
 	try {
@@ -2430,7 +2431,9 @@ async function runLocked<T>(
 					? DEFAULT_RECEIPT_GRACE_DAYS
 					: configuredGraceDays(directory));
 			await ensureCutoverLocked(paths, state, resolvedGraceDays);
-			if (options.compact !== false) await compactIfNeeded(paths, state);
+			if (options.compact !== false) {
+				await compactIfNeeded(paths, state, options.sweep === true);
+			}
 			const result = await action(paths, state, resolvedGraceDays);
 			// The journal is authoritative and has already been fsynced. A derived
 			// snapshot failure must never turn that commit into an apparent failure or
@@ -3970,7 +3973,9 @@ export async function queryHistoricalOutcomes(
 export async function compactKnowledgeReceiptLedger(
 	directory: string,
 ): Promise<ReceiptLedgerResult<{ compacted: true }>> {
-	return runLocked(directory, undefined, async () => ({ compacted: true }));
+	return runLocked(directory, undefined, async () => ({ compacted: true }), {
+		sweep: true,
+	});
 }
 
 async function phaseTransition(
@@ -4108,7 +4113,7 @@ async function phaseTransition(
 			}
 			eventId ||= row.event_id;
 		}
-		if (kind === 'phase_closed') await compactIfNeeded(paths, state);
+		if (kind === 'phase_closed') await compactIfNeeded(paths, state, true);
 		return { event_id: eventId };
 	});
 }
@@ -4164,17 +4169,128 @@ export async function reconcilePhaseClose(
 	return result.ok ? { ok: true, reconciled: true } : result;
 }
 
+/**
+ * Close instants (ms, ascending) of every durably closed phase lifecycle,
+ * keyed by STABLE identity: the explicit/label-parsed phase id when one
+ * exists, the verbatim label only for id-less labels. A phase id can be
+ * closed more than once in one ledger — several sessions recording the same
+ * close, and, because `/swarm close` deliberately keeps the receipt ledger,
+ * a later plan reusing phase ids — so every close is kept, not just one.
+ */
+function closedPhaseIndex(state: LedgerState): {
+	byId: Map<number, number[]>;
+	byLabel: Map<string, number[]>;
+} {
+	const byId = new Map<number, number[]>();
+	const byLabel = new Map<string, number[]>();
+	const record = <K>(map: Map<K, number[]>, key: K, closedAt: number): void => {
+		const list = map.get(key);
+		if (list) list.push(closedAt);
+		else map.set(key, [closedAt]);
+	};
+	for (const lifecycle of state.phaseLifecycle.values()) {
+		if (!lifecycle.closed_at) continue;
+		const closedAt = Date.parse(lifecycle.closed_at);
+		if (!Number.isFinite(closedAt)) continue;
+		const id = lifecycle.phase_id ?? extractPhaseIdFromLabel(lifecycle.phase);
+		if (id !== undefined) record(byId, id, closedAt);
+		else record(byLabel, lifecycle.phase, closedAt);
+	}
+	for (const list of [...byId.values(), ...byLabel.values()]) {
+		list.sort((left, right) => left - right);
+	}
+	return { byId, byLabel };
+}
+
+/**
+ * When a membership's phase was durably closed, in ms, or undefined while the
+ * phase is still open.
+ *
+ * A phase close only stamps `phase_closed_at` on the memberships of the exact
+ * session/task that closed it, so exposures from every other session of the
+ * same phase (delegate lanes, earlier architect sessions) would otherwise
+ * never age out. For those the fallback consults the closed lifecycles by
+ * STABLE phase identity — and only a close that happened AT OR AFTER the
+ * membership was committed can have closed it. That ordering is what keeps
+ * phase ids reused by a later plan (the ledger survives `/swarm close`) from
+ * expiring the new plan's still-open exposures against the old plan's close,
+ * and what keeps a stale-cursor exposure labelled with a long-closed phase
+ * live until a close that actually follows it.
+ */
+function membershipClosedAtMs(
+	membership: ReceiptMembership,
+	closed: ReturnType<typeof closedPhaseIndex>,
+): number | undefined {
+	if (membership.phase_closed_at) {
+		const stamped = Date.parse(membership.phase_closed_at);
+		return Number.isFinite(stamped) ? stamped : undefined;
+	}
+	const committedAt = Date.parse(membership.committed_at);
+	if (!Number.isFinite(committedAt)) return undefined;
+	const id = membership.phase_id ?? extractPhaseIdFromLabel(membership.phase);
+	const closes =
+		id !== undefined
+			? closed.byId.get(id)
+			: membership.phase === undefined
+				? undefined
+				: closed.byLabel.get(membership.phase);
+	return closes?.find((closedAt) => closedAt >= committedAt);
+}
+
+const isResolvedMembership = (m: ReceiptMembership): boolean =>
+	Boolean(m.terminal || m.gate_release);
+
+/**
+ * @param sweepClosedPhases when true, also expire memberships that were never
+ *   stamped closed (unresolved exposures and other sessions' rows of a closed
+ *   phase). Off for the per-operation compaction every locked call performs,
+ *   so steady-state cost is exactly what it was; on at phase close, on the
+ *   explicit maintenance entry point, and whenever the record-count threshold
+ *   already forces a full checkpoint rewrite.
+ */
 async function compactIfNeeded(
 	paths: ReceiptLedgerPaths,
 	state: LedgerState,
+	sweepClosedPhases = false,
 ): Promise<void> {
 	const now = _internals.nowMs();
-	const eligible = [...state.memberships.values()].filter(
-		(m) =>
-			(m.terminal || m.gate_release) &&
-			m.phase_closed_at &&
-			now >= Date.parse(m.phase_closed_at) + m.grace_days * 86_400_000,
-	);
+	const sweep =
+		sweepClosedPhases || state.recordCount > _internals.maxJournalRecords;
+	let eligible: ReceiptMembership[];
+	if (sweep) {
+		// Resolved or not: once the phase is durably closed and the grace window
+		// has elapsed, the membership's obligation is moot and it moves to the
+		// archive (which keeps the full row, so outcome and shown-count rollups
+		// are unchanged). Resolved rows are offered to the archive first: outcome
+		// history must never lose its place to expired unresolved exposures when
+		// capacity is short.
+		const closedPhases = closedPhaseIndex(state);
+		const committedMs = (m: ReceiptMembership): number => {
+			const parsed = Date.parse(m.committed_at);
+			return Number.isFinite(parsed) ? parsed : 0;
+		};
+		eligible = [...state.memberships.values()]
+			.filter((m) => {
+				const closedAt = membershipClosedAtMs(m, closedPhases);
+				return (
+					closedAt !== undefined &&
+					now >= Math.max(closedAt, committedMs(m)) + m.grace_days * 86_400_000
+				);
+			})
+			.sort(
+				(left, right) =>
+					Number(isResolvedMembership(right)) -
+						Number(isResolvedMembership(left)) ||
+					committedMs(left) - committedMs(right),
+			);
+	} else {
+		eligible = [...state.memberships.values()].filter(
+			(m) =>
+				isResolvedMembership(m) &&
+				m.phase_closed_at &&
+				now >= Date.parse(m.phase_closed_at) + m.grace_days * 86_400_000,
+		);
+	}
 	const eligibleEmpty = [...state.emptyTraces.values()].filter(
 		(trace) =>
 			trace.terminal_event_id &&
@@ -4237,9 +4353,11 @@ async function compactIfNeeded(
 		await _internals.atomicWriteFsynced(paths.archive, archiveContent);
 	}
 	const retainedIds = new Set(retainedArchive.map(archiveKey));
+	let removed = 0;
 	for (const membership of eligible) {
 		if (retainedIds.has(archiveKey(membership))) {
 			state.memberships.delete(keyOf(membership.trace_id, membership.entry_id));
+			removed += 1;
 		}
 	}
 	for (const trace of eligibleEmpty) {
@@ -4249,8 +4367,16 @@ async function compactIfNeeded(
 		};
 		if (retainedIds.has(archiveKey(summary))) {
 			state.emptyTraces.delete(emptyKeyOf(trace.trace_id, trace.session_id));
+			removed += 1;
 		}
 	}
+	// Archive capacity can leave every eligible row live (it never discards
+	// prior authority). Rewriting an unchanged checkpoint on every locked
+	// operation would then cost a full-journal rewrite per call for no state
+	// change, so only rewrite when a row moved or the record threshold demands
+	// it.
+	if (removed === 0 && state.recordCount <= _internals.maxJournalRecords)
+		return;
 	for (const traceId of [...state.legacyTraceRegistry]) {
 		const stillLive = [...state.memberships.values()].some(
 			(membership) =>

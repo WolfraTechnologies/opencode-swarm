@@ -1739,6 +1739,7 @@ Controls phase completion gating and validation.
 | `required_agents` | string[] | `["coder", "reviewer", "test_engineer"]` | Agents that must be dispatched before a phase can complete |
 | `require_docs` | boolean | `true` | Require a successful docs-agent completion. This belongs to `phase_complete`, not the QA gate profile. Successful participation is persisted against the exact plan structure and phase so it survives session restart. |
 | `policy` | `"enforce" \| "warn"` | `"enforce"` | When `"enforce"`: missing agents block phase completion. When `"warn"`: missing agents produce warnings only. |
+| `snapshot_max_bytes` | integer | `16777216` | Byte budget (1 MiB–256 MiB) for the phase evidence snapshot identity: `.swarm/evidence/`, `.swarm/spec.md`, `specs/` and `openspec/`. The receipt journal (`.swarm/knowledge-receipts-v2.jsonl`) is hashed in full under its own bound — the receipt store's 32 MiB journal limit — and does not count against this budget (the snapshot is computed several times per completion and hashed synchronously, so raise this only as far as the evidence set needs). When the budget is exceeded, the `snapshot_identity` gate fails with `PHASE_SNAPSHOT_BYTE_LIMIT`, naming the file that crossed it, the observed total, the limit, and the bytes per input. |
 | `regression_sweep.enforce` | boolean | `false` | If `true`, phase_complete warns when no regression-sweep result is found for any task in the phase. Advisory only — does not block phase completion. |
 
 **Example** — Enable regression sweep enforcement:
