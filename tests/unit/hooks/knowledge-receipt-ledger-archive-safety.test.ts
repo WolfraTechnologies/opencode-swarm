@@ -10,6 +10,7 @@ import {
 	queryHistoricalOutcomes,
 	queryLiveMemberships,
 	type ReceiptLedgerResult,
+	validateAndCommitTerminalBatch,
 } from '../../../src/hooks/knowledge-receipt-ledger.js';
 import { isReceiptArchiveSegmentName } from '../../../src/hooks/knowledge-receipt-ledger-storage.js';
 import { createSafeTestDir } from '../../helpers/safe-test-dir.js';
@@ -18,6 +19,7 @@ const DAY_MS = 86_400_000;
 const cleanups: Array<() => void> = [];
 const originalNowMs = _internals.nowMs;
 const originalMaxArchiveRecords = _internals.maxArchiveRecords;
+const originalMaxArchiveBytes = _internals.maxArchiveBytes;
 const originalReadSegment = _internals.readArchiveSegmentFile;
 const originalAtomicWrite = _internals.atomicWriteFsynced;
 const originalConsoleWarn = console.warn;
@@ -30,6 +32,7 @@ const segmentName = (index: number): string =>
 afterEach(() => {
 	_internals.nowMs = originalNowMs;
 	_internals.maxArchiveRecords = originalMaxArchiveRecords;
+	_internals.maxArchiveBytes = originalMaxArchiveBytes;
 	_internals.readArchiveSegmentFile = originalReadSegment;
 	_internals.atomicWriteFsynced = originalAtomicWrite;
 	console.warn = originalConsoleWarn;
@@ -159,6 +162,59 @@ describe('archive passes never lose a row', () => {
 		for (const id of ['r1', 'r2', 'r3', 'r4']) {
 			expect(rollups.get(id)?.shown_count).toBe(1);
 		}
+	});
+
+	test('a changed live row whose new version forces a seal never leaves its stale copy behind', async () => {
+		// The regression this guards: a terminal filed after an interrupted pass
+		// makes the live row differ from its archived copy. The retry deletes the
+		// stale tail copy in memory; if it then SEALS the tail (the new, larger
+		// version no longer fits) without rewriting it, the stale copy stays in
+		// the sealed segment while the new version lands in the next one - the
+		// same key in two segments, double-counted by the cached rollups.
+		const directory = project('receipt-archive-safety-changed-seal-');
+		const base = Date.now();
+		_internals.nowMs = () => base;
+
+		await expose(directory, 'Phase 1', ['a1', 'a2']);
+		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'session-Phase 1'));
+		expect(entryIdsIn(directory, BASE_SEGMENT)).toEqual(['a1', 'a2']);
+		const rowBytes = fs.statSync(swarm(directory, BASE_SEGMENT)).size / 2;
+		// Three plain rows fit; two plain rows plus one carrying a terminal do not.
+		_internals.maxArchiveBytes = Math.floor(rowBytes * 3 + 60);
+
+		await expose(directory, 'Phase 2', ['q']);
+		crashAfterArchiveWrite();
+		const crashed = await commitPhaseClosed(
+			directory,
+			'Phase 2',
+			'session-Phase 2',
+		);
+		expect(crashed.ok).toBe(false);
+		_internals.atomicWriteFsynced = originalAtomicWrite;
+		// q is live AND in the tail (its first version).
+		expect(entryIdsIn(directory, BASE_SEGMENT)).toEqual(['a1', 'a2', 'q']);
+
+		unwrap(
+			await validateAndCommitTerminalBatch(directory, {
+				trace_id: 'trace-Phase 2',
+				session_id: 'session-Phase 2',
+				items: [{ entry_id: 'q', outcome: 'applied' }],
+			}),
+		);
+		_internals.nowMs = () => base + DAY_MS;
+		unwrap(await compactKnowledgeReceiptLedger(directory));
+
+		// The new version did not fit, so the tail was sealed - and the stale
+		// copy was removed from it first.
+		expect(segmentNames(directory)).toEqual([BASE_SEGMENT, segmentName(1)]);
+		expect(entryIdsIn(directory, BASE_SEGMENT)).toEqual(['a1', 'a2']);
+		expect(entryIdsIn(directory, segmentName(1))).toEqual(['q']);
+		const history = unwrap(await queryHistoricalOutcomes(directory, ['q']));
+		expect(history.memberships).toHaveLength(1);
+		expect(history.memberships[0]?.terminal?.outcome).toBe('applied');
+		const rollups = await readAuthoritativeKnowledgeCounterRollups(directory);
+		expect(rollups.get('q')?.shown_count).toBe(1);
+		expect(rollups.get('q')?.applied_explicit_count).toBe(1);
 	});
 
 	test('an interrupted pass that is simply retried writes nothing new and loses nothing', async () => {

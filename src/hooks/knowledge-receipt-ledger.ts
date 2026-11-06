@@ -4645,6 +4645,11 @@ async function archiveSummaries(
 	}
 	const kept: ArchiveSummary[] = [];
 	const placing: ArchiveSummary[] = [];
+	// True once the in-memory tail differs from the file on disk. A CHANGED row's
+	// stale tail copy is deleted below; if the tail is then sealed, that deletion
+	// must still be written, or the stale copy would stay in the sealed segment
+	// while the new version lands in the next one (a key in two segments).
+	let tailDirty = false;
 	for (const summary of summaries) {
 		const key = archiveKey(summary);
 		const prior = tailRows.get(key);
@@ -4655,6 +4660,7 @@ async function archiveSummaries(
 			}
 			tailRows.delete(key);
 			tailBytes -= lineBytes(prior);
+			tailDirty = true;
 		}
 		placing.push(summary);
 	}
@@ -4711,7 +4717,7 @@ async function archiveSummaries(
 			...placing,
 			...kept.filter((summary) => purged.has(archiveKey(summary))),
 		];
-		if (purged.size > 0) {
+		if (purged.size > 0 || tailDirty) {
 			await _internals.atomicWriteFsynced(
 				tail.filePath,
 				serializeArchive([...tailRows.values()]),

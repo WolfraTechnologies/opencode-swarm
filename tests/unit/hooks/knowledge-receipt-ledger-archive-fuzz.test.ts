@@ -25,19 +25,27 @@ import { createSafeTestDir } from '../../helpers/safe-test-dir.js';
  *   2. nothing is duplicated across segments;
  *   3. the counter rollups count every row exactly once.
  * Failures print the seed, step and operation so they replay exactly.
+ *
+ * Verified power: it fails on a pass that loses rows when a retried pass seals
+ * the tail, and on a pass without the seal-time purge of still-live rows. It
+ * does NOT detect a dropped "rewrite the tail when a changed row's stale copy
+ * was removed" (see the deterministic safety test), nor does it exercise empty
+ * traces, concurrent processes, repair, or partial files inside a write.
  */
 
 const DAY_MS = 86_400_000;
-const TRIALS = 40;
+const TRIALS = 45;
 const STEPS = 16;
 const cleanups: Array<() => void> = [];
 const originalNowMs = _internals.nowMs;
 const originalMaxArchiveRecords = _internals.maxArchiveRecords;
+const originalMaxArchiveBytes = _internals.maxArchiveBytes;
 const originalAtomicWrite = _internals.atomicWriteFsynced;
 
 afterEach(() => {
 	_internals.nowMs = originalNowMs;
 	_internals.maxArchiveRecords = originalMaxArchiveRecords;
+	_internals.maxArchiveBytes = originalMaxArchiveBytes;
 	_internals.atomicWriteFsynced = originalAtomicWrite;
 	while (cleanups.length > 0) cleanups.pop()?.();
 });
@@ -83,6 +91,8 @@ function segmentHolders(directory: string): Map<string, string[]> {
 async function assertInvariants(
 	directory: string,
 	universe: Set<string>,
+	/** Ids for which a terminal commit was acknowledged: it must never be lost. */
+	resolvedIds: Set<string>,
 	label: string,
 ): Promise<void> {
 	const live = new Set(
@@ -116,6 +126,12 @@ async function assertInvariants(
 			...where,
 			inHistory: historyIds.filter((x) => x === id).length,
 		}).toEqual({ ...where, inHistory: 1 });
+		// 4. an acknowledged terminal is never hidden behind a stale archived copy
+		if (resolvedIds.has(id)) {
+			const outcome = history.memberships.find((m) => m.entry_id === id)
+				?.terminal?.outcome;
+			expect({ ...where, outcome }).toEqual({ ...where, outcome: 'applied' });
+		}
 	}
 }
 
@@ -128,9 +144,37 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 			const directory = project(`receipt-archive-fuzz-${seed}-`);
 			let clock = Date.now();
 			_internals.nowMs = () => clock;
-			_internals.maxArchiveRecords = pick([1, 2, 3, 50]);
+			const profile = seed % 3;
+			// Rows are ~300-700 bytes: 1500 holds a few, 3000 more, 16 MiB never
+			// binds. Profile 2 pins a byte cap that fits three plain rows but not
+			// two plus one that carries a terminal, with a record cap that never
+			// binds, so only a CHANGED row can force a seal.
+			_internals.maxArchiveRecords = profile === 2 ? 50 : pick([1, 2, 3, 50]);
+			_internals.maxArchiveBytes =
+				profile === 2 ? 1200 : pick([1500, 3000, 16 * 1024 * 1024]);
 
 			const universe = new Set<string>();
+			const resolvedIds = new Set<string>();
+			const groups: Array<{ trace: string; session: string; ids: string[] }> =
+				[];
+			/** File a terminal for a whole group; remember it only if acknowledged. */
+			const fileTerminal = async (group: {
+				trace: string;
+				session: string;
+				ids: string[];
+			}): Promise<void> => {
+				const result = await validateAndCommitTerminalBatch(directory, {
+					trace_id: group.trace,
+					session_id: group.session,
+					items: group.ids.map((entry_id) => ({
+						entry_id,
+						outcome: 'applied' as const,
+					})),
+				});
+				if (result.ok && result.rejected.length === 0) {
+					for (const id of group.ids) resolvedIds.add(id);
+				}
+			};
 			const open: Array<{ phase: string; session: string }> = [];
 			let nextRow = 0;
 			let nextPhase = 0;
@@ -153,21 +197,37 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 				};
 			};
 			/**
-			 * Two generator profiles, alternated by seed, because each reaches
-			 * interleavings the other rarely does:
+			 * Three generator profiles, rotated by seed, because each reaches
+			 * interleavings the others rarely do:
 			 *  - 0: grace and time jumps independent of resolution (finds retries
 			 *    of an interrupted over-threshold pass);
 			 *  - 1: unresolved rows expire the moment their phase closes (sweep
 			 *    only) while resolved rows wait a week (eligible to ORDINARY passes
 			 *    once it elapses), and time jumps often cross that week - the mix
 			 *    that lets an ordinary pass seal a tail an interrupted sweep left
-			 *    rows in.
+			 *    rows in;
+			 *  - 2: rows are never resolved up front; crashed closes leave them
+			 *    live AND in a nearly-full tail, then late terminals change them,
+			 *    so the next pass must replace a stale copy (and possibly seal).
+			 *    This profile PROBES that interleaving but was not observed to
+			 *    detect its worst case (a stale copy left in a sealed tail); that
+			 *    is guarded deterministically by the "changed live row ... forces
+			 *    a seal" test in knowledge-receipt-ledger-archive-safety.test.ts.
 			 */
-			const profile = seed % 2;
 			const graceFor = (resolved: boolean): number =>
-				profile === 1 ? (resolved ? 7 : 0) : pick([0, 0, 7]);
+				profile === 1
+					? resolved
+						? 7
+						: 0
+					: profile === 2
+						? 0
+						: pick([0, 0, 7]);
 			const tickDays = (): number =>
-				profile === 1 ? pick([0, 1, 8, 8]) : Math.floor(rand() * 9);
+				profile === 1
+					? pick([0, 1, 8, 8])
+					: profile === 2
+						? pick([0, 1])
+						: Math.floor(rand() * 9);
 			const randomFailure = (): number | 'checkpoint' =>
 				rand() < 0.6 ? 'checkpoint' : 1 + Math.floor(rand() * 3);
 			const restoreWrites = (): void => {
@@ -175,18 +235,35 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 			};
 
 			for (let step = 0; step < STEPS; step++) {
-				const op = pick([
-					'expose',
-					'expose',
-					'close',
-					'close',
-					'tick',
-					'tick',
-					'sweep',
-					'crash-sweep',
-					'crash-sweep',
-					'crash-close',
-				] as const);
+				const op = pick(
+					profile === 2
+						? ([
+								'expose',
+								'expose',
+								'crash-close',
+								'crash-close',
+								'crash-close',
+								'late-terminal',
+								'late-terminal',
+								'late-terminal',
+								'sweep',
+								'close',
+							] as const)
+						: ([
+								'expose',
+								'expose',
+								'close',
+								'close',
+								'tick',
+								'tick',
+								'sweep',
+								'crash-sweep',
+								'crash-sweep',
+								'crash-close',
+								'late-terminal',
+								'late-terminal',
+							] as const),
+				);
 				const label = `seed ${seed} step ${step} op ${op} (threshold ${_internals.maxArchiveRecords})`;
 
 				if (op === 'expose') {
@@ -197,7 +274,7 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 						{ length: 1 + Math.floor(rand() * 3) },
 						() => `e${nextRow++}`,
 					);
-					const resolved = rand() < 0.5;
+					const resolved = profile === 2 ? false : rand() < 0.5;
 					unwrap(
 						await commitDisplayedMembership(directory, {
 							trace_id: `trace-${phase}`,
@@ -209,19 +286,15 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 						}),
 					);
 					for (const id of ids) universe.add(id);
-					if (resolved) {
-						unwrap(
-							await validateAndCommitTerminalBatch(directory, {
-								trace_id: `trace-${phase}`,
-								session_id: session,
-								items: ids.map((entry_id) => ({
-									entry_id,
-									outcome: 'applied' as const,
-								})),
-							}),
-						);
-					}
+					const group = { trace: `trace-${phase}`, session, ids };
+					groups.push(group);
+					if (resolved) await fileTerminal(group);
 					open.push({ phase, session });
+				} else if (op === 'late-terminal') {
+					// A terminal filed after the row may already have been archived
+					// (accepted while it is still live, rejected once it is gone).
+					if (groups.length === 0) continue;
+					await fileTerminal(pick(groups));
 				} else if (op === 'close' || op === 'crash-close') {
 					if (open.length === 0) continue;
 					const at = Math.floor(rand() * open.length);
@@ -247,7 +320,7 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 					await compactKnowledgeReceiptLedger(directory);
 					restoreWrites();
 				}
-				await assertInvariants(directory, universe, label);
+				await assertInvariants(directory, universe, resolvedIds, label);
 			}
 
 			// Settle: no crashes, everything expired -> every row archived once.
@@ -258,7 +331,12 @@ describe('receipt archive: randomized crash/rollover invariants', () => {
 			}
 			clock += 60 * DAY_MS;
 			unwrap(await compactKnowledgeReceiptLedger(directory));
-			await assertInvariants(directory, universe, `seed ${seed} settled`);
+			await assertInvariants(
+				directory,
+				universe,
+				resolvedIds,
+				`seed ${seed} settled`,
+			);
 			const live = unwrap(await queryLiveMemberships(directory, {}));
 			expect({ seed, live: live.memberships.length }).toEqual({
 				seed,
