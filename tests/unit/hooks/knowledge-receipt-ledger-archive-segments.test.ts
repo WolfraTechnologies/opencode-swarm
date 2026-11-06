@@ -152,7 +152,7 @@ describe('receipt archive segments', () => {
 		);
 	});
 
-	test('the newest copy of a key wins across segments', async () => {
+	test('the newest copy of one membership instance wins across segments', async () => {
 		// Same trace/entry in two directories: one unresolved, one resolved.
 		const unresolved = project('receipt-segments-newest-a-');
 		const resolved = project('receipt-segments-newest-b-');
@@ -173,16 +173,25 @@ describe('receipt archive segments', () => {
 
 		// Older copy (unresolved) in the sealed base segment, newer copy
 		// (resolved) in segment 1, exactly what an interrupted pass followed by
-		// a later terminal produces.
+		// a later terminal produces. They must be copies of ONE membership
+		// instance, so the resolved row takes over the unresolved row's event id
+		// (separate projects mint distinct ids, i.e. distinct instances).
+		const rowOf = (directory: string): Record<string, unknown> =>
+			JSON.parse(
+				fs.readFileSync(swarm(directory, segmentName(0)), 'utf8').trim(),
+			) as Record<string, unknown>;
+		const older = rowOf(unresolved);
+		const newer = { ...rowOf(resolved) };
+		newer.membership_event_id = older.membership_event_id;
 		const target = project('receipt-segments-newest-target-');
 		fs.mkdirSync(swarm(target), { recursive: true });
-		fs.copyFileSync(
-			swarm(unresolved, segmentName(0)),
+		fs.writeFileSync(
 			swarm(target, segmentName(0)),
+			`${JSON.stringify(older)}\n`,
 		);
-		fs.copyFileSync(
-			swarm(resolved, segmentName(0)),
+		fs.writeFileSync(
 			swarm(target, segmentName(1)),
+			`${JSON.stringify(newer)}\n`,
 		);
 
 		const history = unwrap(await queryHistoricalOutcomes(target, ['x']));

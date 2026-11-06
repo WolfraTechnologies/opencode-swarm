@@ -244,6 +244,30 @@ describe('archive passes never lose a row', () => {
 			unwrap(await queryHistoricalOutcomes(directory)).memberships,
 		).toHaveLength(3);
 	});
+
+	test('a tail beyond the append threshold is still readable, so compaction is not wedged by it', async () => {
+		// One large pass is written whole (a pass is never split), so a segment
+		// can legitimately exceed the 16 MiB append threshold. The READ cap is
+		// twice the journal cap; 20 MiB of blank lines (valid, empty JSONL)
+		// would be rejected by a read cap equal to the append threshold.
+		const directory = project('receipt-archive-safety-big-tail-');
+		fs.mkdirSync(swarm(directory), { recursive: true });
+		fs.writeFileSync(
+			swarm(directory, BASE_SEGMENT),
+			Buffer.alloc(20 * 1024 * 1024, '\n'),
+		);
+		_internals.nowMs = () => Date.now();
+		await expose(directory, 'Phase 1', ['big1']);
+		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'session-Phase 1'));
+
+		expect(unwrap(await queryLiveMemberships(directory)).memberships).toEqual(
+			[],
+		);
+		expect(entryIdsIn(directory, BASE_SEGMENT)).toEqual(['big1']);
+		expect(
+			unwrap(await queryHistoricalOutcomes(directory)).memberships,
+		).toHaveLength(1);
+	});
 });
 
 describe('archive read failures are typed and visible', () => {

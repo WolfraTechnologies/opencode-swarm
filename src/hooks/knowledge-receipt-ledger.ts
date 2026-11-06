@@ -331,7 +331,7 @@ const MAX_JOURNAL_BYTES = MAX_KNOWLEDGE_RECEIPT_JOURNAL_BYTES;
 // Archive thresholds are PER SEGMENT and decide only whether a pass APPENDS to
 // the active tail or rolls over to a new segment; they are not a hard limit on
 // what one pass may write (a pass is never split across files, which is what
-// keeps a key from ever sitting in two segments).
+// keeps one membership instance from ever sitting in two segments).
 const MAX_ARCHIVE_RECORDS = 10_000;
 const MAX_ARCHIVE_BYTES = 16 * 1024 * 1024;
 // A pass only archives rows that were live, and the journal itself is capped at
@@ -4603,12 +4603,15 @@ function isStillLive(state: LedgerState, row: ArchiveSummary): boolean {
  *  - If the pass fits the tail's thresholds (or the tail is empty/absent), the
  *    tail is rewritten with the pass appended.
  *  - Otherwise the tail is SEALED and the whole pass becomes one new segment.
- *    Before sealing, copies of rows that are still LIVE in the journal are
- *    dropped from the tail. Those are leftovers of an interrupted earlier pass
- *    (the row was archived but the checkpoint never landed); the live row is
- *    authoritative and will be archived again, exactly once, on its own
- *    schedule. Together these rules mean a key can never sit in two segments,
- *    which is what lets readers fold sealed segments independently.
+ *    Before sealing, copies of membership instances that are still LIVE in the
+ *    journal are dropped from the tail. Those are leftovers of an interrupted
+ *    earlier pass (the row was archived but the checkpoint never landed); the
+ *    live row is authoritative and will be archived again, exactly once, on its
+ *    own schedule. Together these rules mean no pass or crash writes one
+ *    instance into two segments, which is what lets readers fold sealed
+ *    segments independently. (A `repair_knowledge_receipt_ledger` salvage that
+ *    resurrects an instance already checkpointed away can still re-archive it;
+ *    that needs journal corruption first.)
  *
  * Every file is written atomically BEFORE the caller's checkpoint removes the
  * rows from the journal, so a crash can leave a row in both places, never in

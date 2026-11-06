@@ -599,19 +599,25 @@ the thresholds therefore produces one larger segment (bounded by the 32 MiB
 journal it came from; segments are readable up to twice that).
 
 An archive row is identified by its membership *instance*: (trace, entry) plus
-the immutable membership event id assigned when it was committed. A membership
-instance is never written into two segments. Before a tail is sealed, copies of
+the immutable membership event id assigned when it was committed. No archive
+pass or crash writes one instance into two segments. Before a tail is sealed, copies of
 instances that are still live in the journal are dropped from it — those are
 leftovers of an interrupted pass (archived, but the checkpoint never landed);
 the live row is authoritative and is archived again exactly once. A row already
 in the tail is skipped only if it is identical; a changed copy of the same
 instance (a terminal filed after an interrupted pass archived the earlier
 version) replaces it. A crash can therefore leave a row in the journal and one
-archive segment, never in neither and never in two segments. The same (trace,
-entry) committed again after its first membership was archived (possible while
-the committing session's own phase lifecycle is still open) is a *new*
-instance: it is archived beside the first one, never over it, and both count
-toward the rollups and history (it really was shown twice). A stray non-regular
+archive segment, never in neither and never in two segments. (A
+`repair_knowledge_receipt_ledger` salvage of a corrupted journal can resurrect
+an instance that was already checkpointed away; it can then be archived a second
+time into a later segment, which the cumulative rollup counts twice while
+full-history queries deduplicate. That needs journal corruption first.) The
+same (trace, entry) committed again after its first membership was archived
+(only reachable by re-committing an existing trace id while the committing
+session's own phase lifecycle is still open; the shipped committers mint a
+fresh trace id per retrieval) is a *new* instance: it is archived beside the
+first one, never over it, and each instance is counted separately by the
+rollups and history. A stray non-regular
 file with a segment name — including at the base name — never wedges compaction
 or live receipt operations: it is neither read nor written through and new
 segments take the first free index above the tail. Full-history queries and

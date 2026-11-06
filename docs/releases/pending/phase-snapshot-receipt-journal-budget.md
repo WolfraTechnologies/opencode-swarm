@@ -43,7 +43,7 @@
   by capacity, and no migration is needed: an existing archive file simply becomes the tail. Archive
   rows are identified by membership instance (trace, entry and the immutable membership event id).
   Because a pass is one file, and instances still live in the journal are dropped from the tail
-  before it is sealed, an instance is never written into two segments, even across a crash. A row
+  before it is sealed, no pass or crash writes one instance into two segments. A row
   already in the tail is skipped only when identical and a changed copy of the same instance
   replaces it, which also closes a window where a terminal filed after an interrupted archive pass
   could be lost. The same (trace, entry) committed again after its first membership was archived is
@@ -73,7 +73,10 @@ the same session and phase id). A journal made only of such rows, or of an unusu
 phase, can still grow toward the receipt store's 32 MiB journal read limit, beyond which every
 receipt operation reports `store_corrupt` and `phase_complete` reports `PHASE_SNAPSHOT_BYTE_LIMIT`;
 `repair_knowledge_receipt_ledger` reads the journal at the same cap, so that state is not
-recoverable. Archive history is lossless and unbounded on disk. Full-history consumers (outcome
+recoverable. A damaged active tail still blocks compaction (as a damaged single archive always
+did), and the 999999-segment index space, if ever exhausted, fails typed. A journal repair that
+resurrects a membership already checkpointed away can re-archive it into a later segment, which
+the cumulative rollup then counts twice. Archive history is lossless and unbounded on disk. Full-history consumers (outcome
 history, escalation, promotion evidence) stop working past the history read budget until it is
 raised.
 

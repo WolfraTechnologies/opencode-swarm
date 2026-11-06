@@ -134,6 +134,58 @@ describe('a re-created (trace, entry) is a new membership, never an overwrite or
 		expect(rollup?.applied_explicit_count).toBe(1);
 	});
 
+	test('sealing a tail never purges an archived instance because a different live instance shares its trace/entry', async () => {
+		// The seal-time purge drops tail copies of rows that are still LIVE. It
+		// must compare the membership INSTANCE: matching on (trace, entry) alone
+		// would purge the archived instance (it is not in the pass, so it would
+		// not be re-placed) and lose it from the journal AND from every segment.
+		const directory = project('receipt-archive-identity-purge-');
+		let clock = Date.now();
+		_internals.nowMs = () => clock;
+		_internals.maxArchiveRecords = 1;
+
+		await expose(directory, 'SA', 'Phase 1', 'e1');
+		unwrap(
+			await validateAndCommitTerminalBatch(directory, {
+				trace_id: TRACE,
+				session_id: 'SA',
+				items: [{ entry_id: 'e1', outcome: 'applied' }],
+			}),
+		);
+		clock += 1000;
+		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'SB'));
+		const [first] = archivedInstances(directory, 'e1');
+		expect(first).toBeDefined();
+
+		// The same (trace, entry) is live again as a new instance. It stays
+		// live: its only close predates it, so it is not eligible.
+		clock += 1000;
+		await expose(directory, 'SA', 'Phase 1', 'e1');
+		// An unrelated expired row forces a pass that must SEAL segment 0
+		// (the 1-row threshold), which is where the purge runs.
+		clock += 1000;
+		await expose(directory, 'S2', 'Phase 2', 'e2', 'trace-other');
+		clock += 1000;
+		unwrap(await commitPhaseClosed(directory, 'Phase 2', 'S2'));
+
+		const [second] = archivedInstances(directory, 'e2');
+		expect(second?.split('#')[0]).not.toBe(first?.split('#')[0]);
+		// The archived instance survived the seal; the new one is still live.
+		expect(archivedInstances(directory, 'e1')).toEqual([first as string]);
+		expect(
+			unwrap(await queryLiveMemberships(directory)).memberships.map(
+				(m) => m.entry_id,
+			),
+		).toEqual(['e1']);
+		const history = unwrap(await queryHistoricalOutcomes(directory, ['e1']));
+		expect(history.memberships).toHaveLength(2);
+		const rollup = (
+			await readAuthoritativeKnowledgeCounterRollups(directory)
+		).get('e1');
+		expect(rollup?.shown_count).toBe(2);
+		expect(rollup?.applied_explicit_count).toBe(1);
+	});
+
 	test('a re-created membership is counted once per instance even when the first one is sealed', async () => {
 		const directory = project('receipt-archive-identity-sealed-');
 		let clock = Date.now();
