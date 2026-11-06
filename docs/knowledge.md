@@ -28,7 +28,8 @@ When an architect receives a new message, entries from both stores are merged an
 .swarm/knowledge-rejected.jsonl   # entries that failed validation
 .swarm/knowledge-receipts-v2.jsonl          # authoritative receipt journal
 .swarm/knowledge-receipts-v2.snapshot.json  # rebuildable live-state checkpoint
-.swarm/knowledge-receipts-v2-archive.jsonl  # closed receipt summaries
+.swarm/knowledge-receipts-v2-archive.jsonl  # closed receipt summaries (segment 0)
+.swarm/knowledge-receipts-v2-archive.NNNNNN.jsonl  # further archive segments
 ```
 
 The V2 receipt files are always anchored to this canonical project root. They
@@ -573,9 +574,8 @@ The expiry of rows that no stamp reached (unresolved exposures and other
 sessions' rows) is a sweep: it runs when a phase is closed and whenever the
 2,000-record threshold already forces a checkpoint rewrite (the exported
 `compactKnowledgeReceiptLedger` maintenance entry point sweeps too) — never on
-every receipt operation, so steady-state cost is unchanged. Resolved rows are
-offered to the archive before unresolved ones. A terminal filed for a
-membership that has already been archived is rejected as an unknown
+every receipt operation, so steady-state cost is unchanged. A terminal filed
+for a membership that has already been archived is rejected as an unknown
 trace/entry, exactly like a terminal for any other archived membership.
 
 Two cases keep rows live by design, because no close instant exists for them:
@@ -585,12 +585,32 @@ that id earlier closes it again — the ledger deduplicates a repeated close for
 the same session and phase id, so it records no new close instant for other
 sessions' rows. Both are the pre-existing behaviour, not a regression.
 
-The archive keeps its existing capacity bounds (`MAX_ARCHIVE_RECORDS` rows /
-16 MiB). When it is full the overflow stays live in the journal — capacity
-pressure never discards prior authority — so a journal can still grow toward
-the 32 MiB read limit if closed-phase exposures arrive faster than the archive
-can hold them. Beyond that limit the receipt store reports `store_corrupt` for
-every operation.
+The archive is a sequence of **segment files**: the legacy
+`knowledge-receipts-v2-archive.jsonl` is segment 0 and later segments are
+`knowledge-receipts-v2-archive.NNNNNN.jsonl`. The highest-numbered segment is
+the active tail and the only one compaction ever reads or rewrites; every lower
+segment is sealed and immutable. Each segment keeps the original bounds
+(10,000 rows / 16 MiB), but they are now *per segment*: when the tail is full the
+remainder rolls into a new segment, so an expired row never stays live because
+"the archive is full" and nothing is ever discarded. Hot-path cost (injection,
+terminals, gates, compaction) therefore does not grow with history. A row
+already in the tail is skipped only if it is identical; a changed copy (a
+terminal filed after an interrupted pass archived the earlier version) replaces
+it, and readers resolve a key to its newest copy, so a crash can leave a
+duplicate but never lose state.
+
+`queryHistoricalOutcomes` (the source of the outcome and shown-count rollups)
+reads the tail under the ledger lock and the sealed segments after releasing it,
+so a long history read cannot hold up writers. Its total read is bounded at
+128 MiB; beyond that it fails with a typed `store_unavailable` and the rollups
+degrade, while live operations are unaffected. A damaged sealed segment fails
+history queries (`store_corrupt`) without blocking live operations; a damaged
+tail still blocks compaction, as a damaged single archive always did. The live
+journal now only holds rows that are not yet expired; it can still reach the
+32 MiB journal read limit only from live state (open phases, rows within grace,
+the two never-expired cases above), beyond which the receipt store reports
+`store_corrupt` for every operation. `/swarm close` copies every segment into
+its forensic bundle and never removes them.
 
 `phase_complete` binds the exact journal bytes into its snapshot identity, so
 a change to the ledger between preflight and the authoritative transition is

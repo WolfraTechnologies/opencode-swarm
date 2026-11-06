@@ -13,6 +13,7 @@ import {
 	type ReceiptLedgerResult,
 	validateAndCommitTerminalBatch,
 } from '../../../src/hooks/knowledge-receipt-ledger.js';
+import { isReceiptArchiveSegmentName } from '../../../src/hooks/knowledge-receipt-ledger-storage.js';
 import { createSafeTestDir } from '../../helpers/safe-test-dir.js';
 
 const DAY_MS = 86_400_000;
@@ -40,10 +41,15 @@ function unwrap<T>(result: ReceiptLedgerResult<T>): T {
 	return result;
 }
 
-const journalPath = (directory: string): string =>
-	path.join(directory, '.swarm', 'knowledge-receipts-v2.jsonl');
-const archivePath = (directory: string): string =>
-	path.join(directory, '.swarm', 'knowledge-receipts-v2-archive.jsonl');
+/** Every archive segment file (base file and numbered segments), sorted. */
+function archiveFiles(directory: string): string[] {
+	const swarm = path.join(directory, '.swarm');
+	return fs
+		.readdirSync(swarm)
+		.filter((name) => isReceiptArchiveSegmentName(name))
+		.sort()
+		.map((name) => path.join(swarm, name));
+}
 
 async function expose(
 	directory: string,
@@ -79,11 +85,8 @@ async function liveEntryIds(directory: string): Promise<string[]> {
 }
 
 function archivedEntryIds(directory: string): string[] {
-	if (!fs.existsSync(archivePath(directory))) return [];
-	return fs
-		.readFileSync(archivePath(directory), 'utf8')
-		.trim()
-		.split('\n')
+	return archiveFiles(directory)
+		.flatMap((file) => fs.readFileSync(file, 'utf8').trim().split('\n'))
 		.filter(Boolean)
 		.map((line) => (JSON.parse(line) as { entry_id: string }).entry_id)
 		.sort();
@@ -418,41 +421,8 @@ describe('closed-phase receipt expiry', () => {
 		expect(await liveEntryIds(directory)).toEqual(['before-close']);
 	});
 
-	test('resolved history is offered to a short archive before expired unresolved exposures', async () => {
-		const directory = project('receipt-expiry-priority-');
-		const base = Date.now();
-		clockAt(base, 0);
-		// The unresolved row is OLDER and would win a first-come race.
-		await expose(directory, {
-			trace: 't-unresolved',
-			session: 'session-b',
-			phase: 'Phase 1',
-			entries: ['unresolved-first'],
-		});
-		await expose(directory, {
-			trace: 't-resolved',
-			session: 'session-a',
-			phase: 'Phase 1',
-			entries: ['resolved-later'],
-		});
-		unwrap(
-			await validateAndCommitTerminalBatch(directory, {
-				trace_id: 't-resolved',
-				session_id: 'session-a',
-				items: [{ entry_id: 'resolved-later', outcome: 'applied' }],
-			}),
-		);
-		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'session-a'));
-
-		_internals.maxArchiveRecords = 1;
-		clockAt(base, 8);
-		unwrap(await compactKnowledgeReceiptLedger(directory));
-		expect(archivedEntryIds(directory)).toEqual(['resolved-later']);
-		expect(await liveEntryIds(directory)).toEqual(['unresolved-first']);
-	});
-
-	test('archive capacity pressure keeps the overflow live and does not rewrite the journal', async () => {
-		const directory = project('receipt-expiry-capacity-');
+	test('an expired set larger than one archive segment leaves the journal entirely', async () => {
+		const directory = project('receipt-expiry-rollover-');
 		const base = Date.now();
 		clockAt(base, 0);
 		await expose(directory, {
@@ -466,21 +436,16 @@ describe('closed-phase receipt expiry', () => {
 		_internals.maxArchiveRecords = 1;
 		clockAt(base, 8);
 		unwrap(await compactKnowledgeReceiptLedger(directory));
-		// Exactly one row fits; prior authority is never discarded for the rest.
-		expect((await liveEntryIds(directory)).length).toBe(2);
-		expect(archivedEntryIds(directory)).toHaveLength(1);
+		// Segment capacity never leaves a row live: the overflow rolled into
+		// further segments, and history still sees every row.
+		expect(await liveEntryIds(directory)).toEqual([]);
+		expect(archiveFiles(directory)).toHaveLength(3);
+		expect(archivedEntryIds(directory)).toEqual(['e-1', 'e-2', 'e-3']);
 		const historical = unwrap(await queryHistoricalOutcomes(directory));
 		expect(historical.memberships.map((m) => m.entry_id).sort()).toEqual([
 			'e-1',
 			'e-2',
 			'e-3',
 		]);
-
-		// Still over capacity and nothing more can move: further sweeps must not
-		// rewrite an identical checkpoint each time.
-		const journalBefore = fs.readFileSync(journalPath(directory), 'utf8');
-		unwrap(await compactKnowledgeReceiptLedger(directory));
-		unwrap(await compactKnowledgeReceiptLedger(directory));
-		expect(fs.readFileSync(journalPath(directory), 'utf8')).toBe(journalBefore);
 	});
 });

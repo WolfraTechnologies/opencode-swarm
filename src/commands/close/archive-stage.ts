@@ -4,6 +4,10 @@ import path from 'node:path';
 import type { PluginConfig } from '../../config/schema';
 import { observeCloseArchive } from '../../health/learning-health';
 import { isLinked } from '../../hooks/knowledge-link';
+import {
+	isReceiptArchiveSegmentName,
+	RECEIPT_ARCHIVE_BASE_NAME,
+} from '../../hooks/knowledge-receipt-ledger-storage';
 import { telemetry as telemetryEmit } from '../../telemetry';
 import { REPO_MEMORY_FILENAME } from '../../tools/repo-graph/indexed-storage';
 import { log } from '../../utils/logger';
@@ -353,6 +357,68 @@ export async function runArchiveStage(ctx: CloseStageContext): Promise<void> {
 							detail: `${errno ?? 'unknown'}: ${reason}`,
 						});
 					}
+				}
+			}
+		}
+
+		// Receipt archive segments beyond the base file
+		// (knowledge-receipts-v2-archive.NNNNNN.jsonl) are copied for forensics
+		// exactly like the base file, but are deliberately NEVER added to
+		// archivedActiveStateFiles: receipt authority survives close (#2031), so
+		// the clean stage must not see them as cleanable.
+		const receiptArchiveSegments = (
+			await fs.readdir(ctx.swarmDir).catch(() => [] as string[])
+		).filter(
+			(name) =>
+				name !== RECEIPT_ARCHIVE_BASE_NAME && isReceiptArchiveSegmentName(name),
+		);
+		for (const artifact of receiptArchiveSegments) {
+			try {
+				await fs.copyFile(
+					path.join(ctx.swarmDir, artifact),
+					path.join(ctx.archiveDir, artifact),
+				);
+				ctx.archivedFileCount++;
+				ctx.archiveResults.push({
+					artifact,
+					requiredness: 'optional',
+					attempt: 'succeeded',
+					validation: 'not_applicable',
+					source_disposition: 'retained',
+					method: 'copy',
+					reason_code: 'ok',
+				});
+			} catch (err: unknown) {
+				const errno = (err as NodeJS.ErrnoException)?.code;
+				if (errno === 'ENOENT') {
+					ctx.archiveResults.push({
+						artifact,
+						requiredness: 'optional',
+						attempt: 'not_attempted',
+						validation: 'not_applicable',
+						source_disposition: 'absent',
+						method: 'none',
+						reason_code: 'source_absent',
+					});
+				} else {
+					const reason = err instanceof Error ? err.message : String(err);
+					ctx.archiveFailureReasons.set(
+						artifact,
+						`${errno ?? 'unknown'}: ${reason}`,
+					);
+					ctx.warnings.push(
+						`Failed to archive ${artifact} [${errno ?? 'unknown'}]: ${reason}. File preserved (not cleaned up).`,
+					);
+					ctx.archiveResults.push({
+						artifact,
+						requiredness: 'optional',
+						attempt: 'failed',
+						validation: 'not_applicable',
+						source_disposition: 'retained',
+						method: 'copy',
+						reason_code: 'copy_failed',
+						detail: `${errno ?? 'unknown'}: ${reason}`,
+					});
 				}
 			}
 		}

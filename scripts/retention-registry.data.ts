@@ -2736,15 +2736,15 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		stateClass: 'authoritative',
 		privacyClass: 'metadata',
 		directFileExemption: {
-			reason: 'The #2031 authoritative correctness ledger: fsynced append with dev/ino identity checks, quarantine-on-corruption, and phase-close+grace compaction under a custom stale-recovering lock — journal ≤2000 records / archive ≤10000 hard-capped; a swarm.db table cannot reproduce the same one-process lock/quarantine discipline.',
+			reason: 'The #2031 authoritative correctness ledger: fsynced append with dev/ino identity checks, quarantine-on-corruption, and phase-close+grace compaction under a custom stale-recovering lock — journal ≤2000 records, archive in bounded immutable segments (≤10000 rows each); a swarm.db table cannot reproduce the same one-process lock/quarantine discipline.',
 			reviewedIssue: 2031,
 		},
 		writeLimits: {
-			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; MAX_ARCHIVE_RECORDS 10000 / 16 MiB; grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (resolved rows first; a phase-close/maintenance sweep also covers unresolved and other-session rows of a closed phase; capacity pressure retains live :2909-2927)',
+			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; archive is segmented: MAX_ARCHIVE_RECORDS 10000 / 16 MiB PER SEGMENT, a full tail rolls over to knowledge-receipts-v2-archive.NNNNNN.jsonl (sealed segments immutable, nothing discarded or left live); history read budget MAX_ARCHIVE_HISTORY_BYTES 128 MiB; grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (a phase-close/maintenance sweep also covers unresolved and other-session rows of a closed phase)',
 			scope: 'global',
 			citation: 'src/hooks/knowledge-receipt-ledger.ts:255-261,2863-2959',
 		},
-		readBound: { pattern: 'indexed', bound: 'journal ≤2000 records; archive ≤10000 — both hard-capped', sync: true, citation: 'src/hooks/knowledge-receipt-ledger.ts:255-259' },
+		readBound: { pattern: 'indexed', bound: 'journal ≤2000 records; hot path reads at most one archive segment (≤10000 rows / 16 MiB); history reads all segments under a 128 MiB budget', sync: true, citation: 'src/hooks/knowledge-receipt-ledger.ts:255-259' },
 		lockModel: 'custom receipt lock with stale-owner recovery (LOCK_TIMEOUT 500 ms, uninitialized-lock reclamation 30 s)',
 		crashBehavior: 'fsynced append + identity checks; partial tail quarantined + truncated; snapshot failure never fails the commit',
 		closePolicy: 'close may copy for forensics but NEVER deletes live or within-grace authority (#2031)',

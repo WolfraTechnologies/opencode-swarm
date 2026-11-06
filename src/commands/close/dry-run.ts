@@ -2,6 +2,10 @@ import * as fsSync from 'node:fs';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
+	isReceiptArchiveSegmentName,
+	RECEIPT_ARCHIVE_BASE_NAME,
+} from '../../hooks/knowledge-receipt-ledger-storage';
+import {
 	formatResidueInventoryLines,
 	inventorySwarmResidue,
 } from '../../services/swarm-residue';
@@ -51,7 +55,9 @@ export async function runFinalizeDryRun(
 	).filter(
 		(name) =>
 			/^post-mortem-[^/\\]+\.md$/.test(name) ||
-			/^drift-report-phase-\d+\.json$/.test(name),
+			/^drift-report-phase-\d+\.json$/.test(name) ||
+			// Numbered receipt archive segments are copied (never cleaned) on close.
+			(name !== RECEIPT_ARCHIVE_BASE_NAME && isReceiptArchiveSegmentName(name)),
 	);
 	const wouldArchiveDirs = ACTIVE_STATE_DIRS_TO_CLEAN.filter(existsInSwarm);
 	const wouldRemoveTerminal = (

@@ -4,6 +4,7 @@ import {
 	lstat,
 	mkdir,
 	open,
+	readdir,
 	readFile,
 	realpath,
 	rename,
@@ -86,6 +87,100 @@ export function resolveReceiptLedgerPaths(
 		legacyBaseline: validateSwarmPath(root, 'knowledge-counter-baseline.json'),
 		linkPointer: validateSwarmPath(root, 'link.json'),
 	};
+}
+
+/**
+ * The receipt archive is a sequence of segment files. The legacy
+ * `knowledge-receipts-v2-archive.jsonl` is segment 0 (never renamed); later
+ * segments carry a zero-padded index. The highest index is the ACTIVE tail —
+ * the only segment compaction ever reads or rewrites. Every lower segment is
+ * sealed and immutable, so history grows without ever making a hot-path
+ * operation slower.
+ */
+export const RECEIPT_ARCHIVE_BASE_NAME = 'knowledge-receipts-v2-archive.jsonl';
+export const RECEIPT_ARCHIVE_SEGMENT_FILE_PATTERN =
+	/^knowledge-receipts-v2-archive\.(\d{6})\.jsonl$/;
+export const MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX = 999_999;
+
+/**
+ * Index encoded in a numbered segment file name (1..999999), or undefined for
+ * any other name. `.000000.` is reserved for the base file and is not a
+ * segment, so the predicate and the lister can never disagree about it.
+ */
+function numberedSegmentIndex(name: string): number | undefined {
+	const match = RECEIPT_ARCHIVE_SEGMENT_FILE_PATTERN.exec(name);
+	if (!match) return undefined;
+	const index = Number(match[1]);
+	return index >= 1 ? index : undefined;
+}
+
+/** True for the base archive file and for any numbered segment file. */
+export function isReceiptArchiveSegmentName(name: string): boolean {
+	return (
+		name === RECEIPT_ARCHIVE_BASE_NAME ||
+		numberedSegmentIndex(name) !== undefined
+	);
+}
+
+export interface ReceiptArchiveSegment {
+	/** 0 is the legacy base file; 1.. are numbered segments. */
+	index: number;
+	filePath: string;
+	bytes: number;
+}
+
+export function receiptArchiveSegmentPath(
+	paths: ReceiptLedgerPaths,
+	index: number,
+): string {
+	if (index === 0) return paths.archive;
+	if (
+		!Number.isSafeInteger(index) ||
+		index < 1 ||
+		index > MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX
+	) {
+		throw new ReceiptStoreError(
+			'store_unavailable',
+			'receipt archive segment index is out of range',
+		);
+	}
+	return validateSwarmPath(
+		paths.root,
+		`knowledge-receipts-v2-archive.${String(index).padStart(6, '0')}.jsonl`,
+	);
+}
+
+/**
+ * Existing archive segments in ascending index order (base file first). Every
+ * segment must be a regular file: a symlink or directory fails closed rather
+ * than being followed or skipped.
+ */
+export async function listReceiptArchiveSegments(
+	paths: ReceiptLedgerPaths,
+): Promise<ReceiptArchiveSegment[]> {
+	let names: string[];
+	try {
+		names = await readdir(paths.swarmDir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+		throw error;
+	}
+	const segments: ReceiptArchiveSegment[] = [];
+	for (const name of names) {
+		const index =
+			name === RECEIPT_ARCHIVE_BASE_NAME ? 0 : numberedSegmentIndex(name);
+		if (index === undefined) continue;
+		const filePath = receiptArchiveSegmentPath(paths, index);
+		const info = await lstat(filePath);
+		if (info.isSymbolicLink() || !info.isFile()) {
+			throw new ReceiptStoreError(
+				'store_unavailable',
+				`receipt artifact is not a regular file: ${name}`,
+			);
+		}
+		segments.push({ index, filePath, bytes: info.size });
+	}
+	return segments.sort((left, right) => left.index - right.index);
 }
 
 function validateExistingRegularFile(filePath: string): void {

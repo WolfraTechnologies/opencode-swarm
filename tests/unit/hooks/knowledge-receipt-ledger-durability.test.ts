@@ -251,7 +251,7 @@ describe('knowledge receipt ledger durability regressions', () => {
 		).toHaveLength(1);
 	});
 
-	test('retains overflow authority live instead of dropping old archive summaries', async () => {
+	test('rolls overflow into a new archive segment instead of leaving it live or dropping it', async () => {
 		const directory = project('receipt-archive-cap-');
 		_internals.maxArchiveRecords = 1;
 		unwrap(
@@ -277,20 +277,23 @@ describe('knowledge receipt ledger durability regressions', () => {
 			}),
 		);
 		unwrap(await commitPhaseClosed(directory, 'phase-cap'));
+		// Nothing stays live and nothing is dropped: the segment is full at one
+		// row, so the second row rolled into segment 000001.
 		expect(
 			unwrap(await queryLiveMemberships(directory)).memberships,
-		).toHaveLength(1);
+		).toHaveLength(0);
 		expect(
 			unwrap(await queryHistoricalOutcomes(directory)).memberships,
 		).toHaveLength(2);
-		const archiveLines = fs
-			.readFileSync(
-				path.join(directory, '.swarm', 'knowledge-receipts-v2-archive.jsonl'),
-				'utf8',
-			)
-			.trim()
-			.split('\n');
-		expect(archiveLines).toHaveLength(1);
+		const archiveDir = path.join(directory, '.swarm');
+		for (const name of [
+			'knowledge-receipts-v2-archive.jsonl',
+			'knowledge-receipts-v2-archive.000001.jsonl',
+		]) {
+			expect(
+				fs.readFileSync(path.join(archiveDir, name), 'utf8').trim().split('\n'),
+			).toHaveLength(1);
+		}
 	});
 
 	test('recovers an archive-first checkpoint crash without duplicate history', async () => {
