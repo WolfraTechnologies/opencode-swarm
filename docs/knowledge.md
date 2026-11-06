@@ -573,9 +573,8 @@ that a stale phase cursor labelled with a long-closed phase live.
 
 The expiry of rows that no stamp reached (unresolved exposures and other
 sessions' rows) is a sweep: it runs when a phase is closed and whenever the
-2,000-record threshold already forces a checkpoint rewrite (the exported
-`compactKnowledgeReceiptLedger` maintenance entry point sweeps too) — never on
-every receipt operation, so steady-state cost is unchanged. A terminal filed
+2,000-record threshold already forces a checkpoint rewrite — never on every
+receipt operation, so steady-state cost is unchanged. A terminal filed
 for a membership that has already been archived is rejected as an unknown
 trace/entry, exactly like a terminal for any other archived membership.
 
@@ -590,30 +589,40 @@ The archive is a sequence of **segment files**: the legacy
 `knowledge-receipts-v2-archive.jsonl` is segment 0 and later segments are
 `knowledge-receipts-v2-archive.NNNNNN.jsonl`. The highest-numbered segment is
 the active tail and the only one compaction ever reads or rewrites; every lower
-segment is sealed and immutable. Each segment keeps the original bounds
-(10,000 rows / 16 MiB), but they are now *per segment*: when the tail is full the
-remainder rolls into a new segment, so an expired row never stays live because
-"the archive is full" and nothing is ever discarded (a single row larger than a
-whole segment is the one exception: it stays live rather than producing an
-unreadable file). A row already in the tail is skipped only if it is identical;
-a changed copy (a terminal filed after an interrupted pass archived the earlier
-version) replaces it, and readers resolve a key to its newest copy, so a crash
-can leave a duplicate but never lose state. A stray non-regular file with a
-segment name never wedges compaction: it is neither read nor reused, new
-segments are allocated above it, and full-history reads fail closed on it.
+segment is sealed and immutable. The old bounds (10,000 rows / 16 MiB) are now
+*per-segment append thresholds*: a pass that fits the tail is appended to it;
+otherwise the tail is sealed and the pass becomes one new segment. A pass is
+never split across files and is never refused, so an expired row never stays
+live because "the archive is full" and nothing is discarded. A pass larger than
+the thresholds therefore produces one larger segment (bounded by the 32 MiB
+journal it came from; segments are readable up to twice that).
+
+A key is never written into two segments. Before a tail is sealed, copies of
+rows that are still live in the journal are dropped from it — those are
+leftovers of an interrupted pass (archived, but the checkpoint never landed);
+the live row is authoritative and is archived again exactly once. A row already
+in the tail is skipped only if it is identical; a changed copy (a terminal
+filed after an interrupted pass archived the earlier version) replaces it. A
+crash can therefore leave a row in the journal and one archive segment, never
+in neither and never in two segments. A stray non-regular file with a segment
+name — including at the base name — never wedges compaction or any other
+receipt operation: it is neither read nor written through, new segments take the
+first free index above the tail, and full-history reads fail closed on it.
 
 What reads how much of the archive:
 
 - **Compaction, terminals, gates, injection bookkeeping** read at most the
-  active tail (≤16 MiB), plus a directory listing.
+  active tail (≤16 MiB in normal operation), plus a directory listing.
 - **Counter rollups** (`readAuthoritativeKnowledgeCounterRollups`, on the
-  per-message injection path) fold the live rows and the tail, and reuse an
-  in-process cache of each *sealed* segment's counter contribution keyed by the
-  segment's file identity. The first call in a process streams each sealed
-  segment once; after that the cost is live + tail + a merge, and there is no
-  history size limit. Because the cache is per segment, a row that a crash left
-  in two segments is counted once per copy (a +1 on that entry's shown count),
-  which can only follow an interrupted archive pass.
+  per-message injection path) fold the live rows and the tail onto a cached
+  *cumulative* rollup of all sealed segments. The cache holds one aggregate per
+  project (size bounded by the number of distinct knowledge entries, not by the
+  number of segments), is extended when a segment seals, and is rebuilt only if
+  an already-folded segment's file identity changes. The first call in a process
+  streams each sealed segment once; after that the cost is live + tail + a merge,
+  and there is no history size limit. If the rollup cannot be built (for example
+  a damaged sealed segment), counters read as zero and one critical warning is
+  logged per project per process.
 - **Full-history queries** (`queryHistoricalOutcomes`: outcome history,
   escalation windows, promotion evidence) read the tail under the ledger lock
   and the sealed segments after releasing it, so they cannot hold up writers.
@@ -627,8 +636,10 @@ What reads how much of the archive:
 The live journal now holds only rows that are not yet expired; it can still
 reach the 32 MiB journal read limit from live state alone (open phases, rows
 within grace, the two never-expired cases above), beyond which the receipt
-store reports `store_corrupt` for every operation. `/swarm close` copies every
-segment into its forensic bundle and never removes them.
+store reports `store_corrupt` for every operation. Recovery is not possible
+past that point: `repair_knowledge_receipt_ledger` reads the journal at the same
+32 MiB cap, and the journal must not be hand-truncated. `/swarm close` copies
+every segment into its forensic bundle and never removes them.
 
 `phase_complete` binds the exact journal bytes into its snapshot identity, so
 a change to the ledger between preflight and the authoritative transition is

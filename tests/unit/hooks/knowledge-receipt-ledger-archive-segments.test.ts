@@ -100,47 +100,44 @@ const identity = (file: string): string => {
 };
 
 describe('receipt archive segments', () => {
-	test('a full tail rolls over to numbered segments and only the tail is ever rewritten', async () => {
+	test('a full tail rolls over to numbered segments, each pass writes one file, and sealed segments are never rewritten', async () => {
 		const directory = project('receipt-segments-tail-only-');
 		const base = Date.now();
 		_internals.maxArchiveRecords = 2;
+		const sweepAt = async (days: number): Promise<void> => {
+			_internals.nowMs = () => base + days * DAY_MS;
+			unwrap(await compactKnowledgeReceiptLedger(directory));
+		};
 
+		// Pass 1: three rows exceed the 2-row threshold, but a pass is never
+		// split and an empty tail accepts it whole, so segment 0 holds all three.
 		await closedPhase(directory, base, 'Phase 1', ['a1', 'a2', 'a3']);
-		_internals.nowMs = () => base + 8 * DAY_MS;
-		unwrap(await compactKnowledgeReceiptLedger(directory));
-		// Two rows fill segment 0; the third rolls into segment 1.
+		await sweepAt(8);
+		expect(segmentFiles(directory)).toEqual([segmentName(0)]);
+		expect(rowsIn(directory, segmentName(0))).toHaveLength(3);
+		const segment0 = identity(swarm(directory, segmentName(0)));
+
+		// Pass 2: the tail is over its threshold, so it is sealed (untouched: it
+		// holds nothing live) and the pass becomes segment 1.
+		await closedPhase(directory, base + 9 * DAY_MS, 'Phase 2', ['b1', 'b2']);
+		await sweepAt(20);
 		expect(segmentFiles(directory)).toEqual([segmentName(0), segmentName(1)]);
-		expect(rowsIn(directory, segmentName(0))).toHaveLength(2);
-		expect(rowsIn(directory, segmentName(1))).toHaveLength(1);
-		const sealedBefore = identity(swarm(directory, segmentName(0)));
+		expect(identity(swarm(directory, segmentName(0)))).toBe(segment0);
+		expect(rowsIn(directory, segmentName(1))).toHaveLength(2);
+		const segment1 = identity(swarm(directory, segmentName(1)));
 
-		// A later phase's rows fill the tail (segment 1) and spill into segment 2.
-		_internals.nowMs = () => base + 9 * DAY_MS;
-		unwrap(
-			await commitDisplayedMembership(directory, {
-				trace_id: 'trace-Phase 2',
-				session_id: 'session-b',
-				phase: 'Phase 2',
-				entries: ['b1', 'b2'].map((entry_id) => ({
-					entry_id,
-					critical: false,
-				})),
-				exposure_kind: 'delegate_directive',
-			}),
-		);
-		unwrap(await commitPhaseClosed(directory, 'Phase 2', 'session-closer'));
-		_internals.nowMs = () => base + 20 * DAY_MS;
-		unwrap(await compactKnowledgeReceiptLedger(directory));
-
+		// Pass 3: segment 1 is full too, so it is sealed and segment 2 is created.
+		await closedPhase(directory, base + 21 * DAY_MS, 'Phase 3', ['c1']);
+		await sweepAt(40);
 		expect(segmentFiles(directory)).toEqual([
 			segmentName(0),
 			segmentName(1),
 			segmentName(2),
 		]);
-		// Sealed segment 0 was not rewritten: same inode, size and mtime.
-		expect(identity(swarm(directory, segmentName(0)))).toBe(sealedBefore);
-		expect(rowsIn(directory, segmentName(1))).toHaveLength(2);
+		expect(identity(swarm(directory, segmentName(0)))).toBe(segment0);
+		expect(identity(swarm(directory, segmentName(1)))).toBe(segment1);
 		expect(rowsIn(directory, segmentName(2))).toHaveLength(1);
+
 		const history = unwrap(await queryHistoricalOutcomes(directory));
 		expect(history.memberships.map((m) => m.entry_id).sort()).toEqual([
 			'a1',
@@ -148,6 +145,7 @@ describe('receipt archive segments', () => {
 			'a3',
 			'b1',
 			'b2',
+			'c1',
 		]);
 		expect(unwrap(await queryLiveMemberships(directory)).memberships).toEqual(
 			[],
@@ -196,11 +194,15 @@ describe('receipt archive segments', () => {
 		const directory = project('receipt-segments-sealed-corrupt-');
 		const base = Date.now();
 		_internals.maxArchiveRecords = 1;
-		await closedPhase(directory, base, 'Phase 1', ['c1', 'c2']);
+		await closedPhase(directory, base, 'Phase 1', ['c1']);
 		_internals.nowMs = () => base + 8 * DAY_MS;
+		unwrap(await compactKnowledgeReceiptLedger(directory));
+		await closedPhase(directory, base + 9 * DAY_MS, 'Phase 2', ['c2']);
+		_internals.nowMs = () => base + 20 * DAY_MS;
 		unwrap(await compactKnowledgeReceiptLedger(directory));
 		expect(segmentFiles(directory)).toHaveLength(2);
 
+		// Segment 0 is now sealed; damage it.
 		fs.writeFileSync(swarm(directory, segmentName(0)), '{not valid}\n');
 
 		const history = await queryHistoricalOutcomes(directory);
@@ -268,7 +270,7 @@ describe('receipt archive segments', () => {
 		const paths = resolveReceiptLedgerPaths(directory);
 		const listing = await listReceiptArchiveSegments(paths);
 		expect(listing.segments.map((s) => s.index)).toEqual([0]);
-		expect(listing.highestIndex).toBe(0);
+		expect([...listing.occupied]).toEqual([0]);
 		expect(listing.irregular).toEqual([]);
 		expect(
 			unwrap(await queryHistoricalOutcomes(directory)).memberships,

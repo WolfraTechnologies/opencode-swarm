@@ -421,10 +421,11 @@ describe('closed-phase receipt expiry', () => {
 		expect(await liveEntryIds(directory)).toEqual(['before-close']);
 	});
 
-	test('an expired set larger than one archive segment leaves the journal entirely', async () => {
+	test('archive thresholds never leave an expired row live, across passes', async () => {
 		const directory = project('receipt-expiry-rollover-');
 		const base = Date.now();
 		clockAt(base, 0);
+		_internals.maxArchiveRecords = 1;
 		await expose(directory, {
 			trace: 't-1',
 			session: 'session-b',
@@ -432,20 +433,33 @@ describe('closed-phase receipt expiry', () => {
 			entries: ['e-1', 'e-2', 'e-3'],
 		});
 		unwrap(await commitPhaseClosed(directory, 'Phase 1', 'session-a'));
-
-		_internals.maxArchiveRecords = 1;
 		clockAt(base, 8);
 		unwrap(await compactKnowledgeReceiptLedger(directory));
-		// Segment capacity never leaves a row live: the overflow rolled into
-		// further segments, and history still sees every row.
+		// A pass is never split, so all three rows land in segment 0 even though
+		// it is over the 1-row threshold...
 		expect(await liveEntryIds(directory)).toEqual([]);
-		expect(archiveFiles(directory)).toHaveLength(3);
-		expect(archivedEntryIds(directory)).toEqual(['e-1', 'e-2', 'e-3']);
+		expect(archiveFiles(directory)).toHaveLength(1);
+
+		// ...and the next pass rolls over into segment 1.
+		clockAt(base, 9);
+		await expose(directory, {
+			trace: 't-2',
+			session: 'session-b',
+			phase: 'Phase 2',
+			entries: ['e-4'],
+		});
+		unwrap(await commitPhaseClosed(directory, 'Phase 2', 'session-a'));
+		clockAt(base, 20);
+		unwrap(await compactKnowledgeReceiptLedger(directory));
+		expect(await liveEntryIds(directory)).toEqual([]);
+		expect(archiveFiles(directory)).toHaveLength(2);
+		expect(archivedEntryIds(directory)).toEqual(['e-1', 'e-2', 'e-3', 'e-4']);
 		const historical = unwrap(await queryHistoricalOutcomes(directory));
 		expect(historical.memberships.map((m) => m.entry_id).sort()).toEqual([
 			'e-1',
 			'e-2',
 			'e-3',
+			'e-4',
 		]);
 	});
 });

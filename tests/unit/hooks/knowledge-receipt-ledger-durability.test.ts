@@ -254,46 +254,42 @@ describe('knowledge receipt ledger durability regressions', () => {
 	test('rolls overflow into a new archive segment instead of leaving it live or dropping it', async () => {
 		const directory = project('receipt-archive-cap-');
 		_internals.maxArchiveRecords = 1;
-		unwrap(
-			await commitDisplayedMembership(directory, {
-				trace_id: 'trace-cap',
-				session_id: 'session-cap',
-				phase: 'phase-cap',
-				grace_days: 0,
-				entries: [
-					{ entry_id: 'entry-one', critical: false },
-					{ entry_id: 'entry-two', critical: false },
-				],
-			}),
-		);
-		unwrap(
-			await validateAndCommitTerminalBatch(directory, {
-				trace_id: 'trace-cap',
-				session_id: 'session-cap',
-				items: [
-					{ entry_id: 'entry-one', outcome: 'applied' },
-					{ entry_id: 'entry-two', outcome: 'applied' },
-				],
-			}),
-		);
-		unwrap(await commitPhaseClosed(directory, 'phase-cap'));
-		// Nothing stays live and nothing is dropped: the segment is full at one
-		// row, so the second row rolled into segment 000001.
+		const close = async (phase: string, entryIds: string[]): Promise<void> => {
+			unwrap(
+				await commitDisplayedMembership(directory, {
+					trace_id: `trace-${phase}`,
+					session_id: `session-${phase}`,
+					phase,
+					grace_days: 0,
+					entries: entryIds.map((entry_id) => ({ entry_id, critical: false })),
+				}),
+			);
+			unwrap(
+				await validateAndCommitTerminalBatch(directory, {
+					trace_id: `trace-${phase}`,
+					session_id: `session-${phase}`,
+					items: entryIds.map((entry_id) => ({ entry_id, outcome: 'applied' })),
+				}),
+			);
+			unwrap(await commitPhaseClosed(directory, phase));
+		};
+		// A pass is never split: two rows land in segment 0 despite the 1-row
+		// threshold. The next pass finds the tail over threshold and rolls over.
+		await close('phase-cap-one', ['entry-one', 'entry-two']);
+		await close('phase-cap-two', ['entry-three']);
+		// Nothing stays live and nothing is dropped.
 		expect(
 			unwrap(await queryLiveMemberships(directory)).memberships,
 		).toHaveLength(0);
 		expect(
 			unwrap(await queryHistoricalOutcomes(directory)).memberships,
-		).toHaveLength(2);
+		).toHaveLength(3);
 		const archiveDir = path.join(directory, '.swarm');
-		for (const name of [
-			'knowledge-receipts-v2-archive.jsonl',
-			'knowledge-receipts-v2-archive.000001.jsonl',
-		]) {
-			expect(
-				fs.readFileSync(path.join(archiveDir, name), 'utf8').trim().split('\n'),
-			).toHaveLength(1);
-		}
+		const lines = (name: string): number =>
+			fs.readFileSync(path.join(archiveDir, name), 'utf8').trim().split('\n')
+				.length;
+		expect(lines('knowledge-receipts-v2-archive.jsonl')).toBe(2);
+		expect(lines('knowledge-receipts-v2-archive.000001.jsonl')).toBe(1);
 	});
 
 	test('recovers an archive-first checkpoint crash without duplicate history', async () => {

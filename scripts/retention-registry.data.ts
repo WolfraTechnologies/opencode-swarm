@@ -2657,10 +2657,10 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		canonicalRoot: 'project-swarm',
 		writerModules: ['src/hooks/knowledge-events.ts'],
 		writerCitations: [
-			'src/hooks/knowledge-events.ts:387 appendKnowledgeEvent / :407 appendKnowledgeEventsBatch — ONE lock + ONE trim pass (:417-448); :500 appendHiveKnowledgeEvent (FIFO 5000, no baseline folding)',
+			'src/hooks/knowledge-events.ts:395 appendKnowledgeEvent / :415 appendKnowledgeEventsBatch — ONE lock + ONE trim pass (:425-456); :508 appendHiveKnowledgeEvent (FIFO 5000, no baseline folding)',
 		],
 		readerCitations: [
-			'src/hooks/knowledge-events.ts:573 readKnowledgeEvents — full-file with optional cap, skips corrupt lines',
+			'src/hooks/knowledge-events.ts:581 readKnowledgeEvents — full-file with optional cap, skips corrupt lines',
 			'curator-postmortem / knowledge-escalator / knowledge-diagnostics / learning-metrics — diagnostic consumers; NO correctness consumer post-#2031',
 		],
 		schemaVersion: 'schema_version 1',
@@ -2699,7 +2699,7 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 			'src/hooks/knowledge-application.ts:121 appendAudit — locked append, FIFO cap enforced after append (:143-145)',
 			'src/hooks/knowledge-application-gate.ts:418 knowledgeApplicationTransformScan — commits via receipt ledger + legacy audit; warn events → events.jsonl :406',
 		],
-		readerCitations: ['src/hooks/knowledge-application.ts:403 getShownButNotAcknowledged — full-file; knowledge-events.ts:615 readLegacyApplicationRecords (counter rollups)'],
+		readerCitations: ['src/hooks/knowledge-application.ts:403 getShownButNotAcknowledged — full-file; knowledge-events.ts:623 readLegacyApplicationRecords (counter rollups)'],
 		schemaVersion: 'legacy v2 audit (n_a stored as acknowledged — documented lossiness)',
 		stateClass: 'derived-rebuildable',
 		privacyClass: 'metadata',
@@ -2742,9 +2742,9 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		writeLimits: {
 			bound: 'MAX_JOURNAL_RECORDS 2000 / 32 MiB; archive is segmented: MAX_ARCHIVE_RECORDS 10000 / 16 MiB PER SEGMENT, a full tail rolls over to knowledge-receipts-v2-archive.NNNNNN.jsonl (sealed segments immutable, nothing discarded or left live); full-history read budget knowledge.receipt_archive_history_budget_mb (default 128 MiB, raise-only); grace DEFAULT_RECEIPT_GRACE_DAYS 7; compaction moves closed+grace-elapsed to archive (a phase-close/maintenance sweep also covers unresolved and other-session rows of a closed phase)',
 			scope: 'global',
-			citation: 'src/hooks/knowledge-receipt-ledger.ts:255-261,2863-2959',
+			citation: 'src/hooks/knowledge-receipt-ledger.ts:327-348,4472-4700',
 		},
-		readBound: { pattern: 'indexed', bound: 'journal ≤2000 records; compaction/terminals/gates read at most the active archive segment (≤10000 rows / 16 MiB); counter rollups cache each sealed segment by file identity (live + tail per call); full-history queries read all segments under knowledge.receipt_archive_history_budget_mb', sync: true, citation: 'src/hooks/knowledge-receipt-ledger.ts:255-259' },
+		readBound: { pattern: 'indexed', bound: 'journal ≤2000 records; compaction/terminals/gates read at most the active archive segment (≤10000 rows / 16 MiB); counter rollups cache each sealed segment by file identity (live + tail per call); full-history queries read all segments under knowledge.receipt_archive_history_budget_mb', sync: true, citation: 'src/hooks/knowledge-receipt-ledger.ts:327-343' },
 		lockModel: 'custom receipt lock with stale-owner recovery (LOCK_TIMEOUT 500 ms, uninitialized-lock reclamation 30 s)',
 		crashBehavior: 'fsynced append + identity checks; partial tail quarantined + truncated; snapshot failure never fails the commit',
 		closePolicy: 'close may copy for forensics but NEVER deletes live or within-grace authority (#2031)',
@@ -2757,7 +2757,7 @@ export const RETENTION_REGISTRY: readonly RetentionRow[] = [
 		legacyCompatibility: 'legacy_unverifiable typed state for missing/evicted/linked membership — never inferred',
 		healthSignal: 'receipt completion metrics (#2044 consumer)',
 		owner: '#2031 (merged)',
-		disposition: { kind: 'not-a-defect', proof: 'The #2031 partition: hard journal/archive caps, phase-close+grace compaction, cross-process lock, quarantine — the authoritative correctness store (src/hooks/knowledge-receipt-ledger.ts:255-261).' },
+		disposition: { kind: 'not-a-defect', proof: 'The #2031 partition: hard journal cap, segmented lossless archive, phase-close+grace compaction, cross-process lock, quarantine — the authoritative correctness store (src/hooks/knowledge-receipt-ledger.ts:327-348).' },
 	},
 	{
 		id: 'mcp-write-receipts',

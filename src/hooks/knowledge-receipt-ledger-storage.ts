@@ -98,7 +98,7 @@ export function resolveReceiptLedgerPaths(
  * operation slower.
  */
 export const RECEIPT_ARCHIVE_BASE_NAME = 'knowledge-receipts-v2-archive.jsonl';
-export const RECEIPT_ARCHIVE_SEGMENT_FILE_PATTERN =
+const RECEIPT_ARCHIVE_SEGMENT_FILE_PATTERN =
 	/^knowledge-receipts-v2-archive\.(\d{6})\.jsonl$/;
 export const MAX_RECEIPT_ARCHIVE_SEGMENT_INDEX = 999_999;
 
@@ -127,7 +127,7 @@ export interface ReceiptArchiveSegment {
 	index: number;
 	filePath: string;
 	bytes: number;
-	/** `index:ino:size:mtimeMs` — changes whenever the file is rewritten. */
+	/** `index:dev:ino:size:mtimeMs` — changes whenever the file is rewritten. */
 	identity: string;
 }
 
@@ -156,11 +156,12 @@ export interface ReceiptArchiveListing {
 	/** Regular-file segments in ascending index order (base file first). */
 	segments: ReceiptArchiveSegment[];
 	/**
-	 * Highest index among EVERY matching name, regular or not (-1 when none).
-	 * New segments are allocated above it so a name that is occupied by
-	 * something irregular is never reused or written through.
+	 * Every index whose name is in use, regular or not. A new segment takes the
+	 * first free index above the tail, so a name occupied by something
+	 * irregular is never reused or written through (and an irregular entry
+	 * parked at the very top of the index space cannot exhaust allocation).
 	 */
-	highestIndex: number;
+	occupied: Set<number>;
 	/** Matching names that are not regular files (symlink, directory, ...). */
 	irregular: string[];
 }
@@ -179,18 +180,18 @@ export async function listReceiptArchiveSegments(
 		names = await readdir(paths.swarmDir);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-			return { segments: [], highestIndex: -1, irregular: [] };
+			return { segments: [], occupied: new Set(), irregular: [] };
 		}
 		throw error;
 	}
 	const segments: ReceiptArchiveSegment[] = [];
 	const irregular: string[] = [];
-	let highestIndex = -1;
+	const occupied = new Set<number>();
 	for (const name of names) {
 		const index =
 			name === RECEIPT_ARCHIVE_BASE_NAME ? 0 : numberedSegmentIndex(name);
 		if (index === undefined) continue;
-		highestIndex = Math.max(highestIndex, index);
+		occupied.add(index);
 		const filePath = receiptArchiveSegmentPath(paths, index);
 		const info = await lstat(filePath);
 		if (info.isSymbolicLink() || !info.isFile()) {
@@ -203,11 +204,11 @@ export async function listReceiptArchiveSegments(
 			bytes: info.size,
 			// Sealed segments are immutable, so a changed identity means a
 			// rewritten (or replaced) file: safe as an in-process cache key.
-			identity: `${index}:${info.ino}:${info.size}:${info.mtimeMs}`,
+			identity: `${index}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`,
 		});
 	}
 	segments.sort((left, right) => left.index - right.index);
-	return { segments, highestIndex, irregular: irregular.sort() };
+	return { segments, occupied, irregular: irregular.sort() };
 }
 
 /** Throw the fail-closed error for a listing that contains irregular names. */
@@ -251,10 +252,14 @@ async function preparePaths(paths: ReceiptLedgerPaths): Promise<void> {
 			'receipt artifact parent escaped the project .swarm directory',
 		);
 	}
+	// The archive base file is deliberately NOT validated here: every archive
+	// segment, including segment 0, is validated by listReceiptArchiveSegments,
+	// where an irregular entry is handled per caller (history fails closed,
+	// compaction allocates around it). A strict check here would let a stray
+	// symlink at the base name wedge EVERY receipt operation.
 	for (const artifact of [
 		paths.journal,
 		paths.snapshot,
-		paths.archive,
 		paths.quarantine,
 		paths.lockTarget,
 	]) {

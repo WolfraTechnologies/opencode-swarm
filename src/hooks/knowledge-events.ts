@@ -30,7 +30,7 @@ import lockfile from 'proper-lockfile';
 import { atomicWriteFile } from '../evidence/task-file.js';
 import { resolveHiveEventsPath as resolveHiveEventsPathImpl } from '../knowledge/hive-paths.js';
 import { canonicalRootKey } from '../utils/canonical-root.js';
-import { warn } from '../utils/logger.js';
+import { criticalWarn, warn } from '../utils/logger.js';
 import { resolveKnowledgeStoreDir } from './knowledge-link.js';
 import {
 	queryHistoricalOutcomes,
@@ -67,14 +67,22 @@ const counterRollupCache = new Map<string, CounterRollupCacheEntry>();
 const MAX_COUNTER_ROLLUP_CACHE_DIRS = 32;
 
 /**
- * Per-entry counter contribution of ONE sealed receipt archive segment, keyed
- * by `<canonical root>|<segment identity>`. Sealed segments are immutable and
- * their identity (inode, size, mtime) changes if one is ever rewritten, so an
- * entry can never go stale. Bounded FIFO/LRU: each value is only
- * O(distinct entries in the segment).
+ * Cumulative per-entry counter rollup over ALL sealed receipt archive segments
+ * of one project, plus the ordered segment identities it was built from.
+ * Sealed segments are immutable and their identity (dev, inode, size, mtime)
+ * changes if one is ever rewritten, so the cache is extended when new segments
+ * seal and rebuilt from scratch if any earlier identity differs. Its size is
+ * O(distinct knowledge entries) per project — independent of how many
+ * segments there are — and the map is FIFO-bounded across projects.
  */
-const sealedSegmentRollupCache = new Map<string, Map<string, CounterRollup>>();
-const MAX_SEALED_SEGMENT_ROLLUP_CACHE = 256;
+interface SealedRollupCacheEntry {
+	identities: string[];
+	rollup: Map<string, CounterRollup>;
+}
+const sealedRollupCache = new Map<string, SealedRollupCacheEntry>();
+const MAX_SEALED_ROLLUP_CACHE_ROOTS = 32;
+/** Roots already warned about an unavailable authoritative rollup (bounded). */
+const rollupUnavailableWarned = new Set<string>();
 
 // ============================================================================
 // Event schema
@@ -1174,48 +1182,85 @@ export async function readAuthoritativeKnowledgeCounterRollups(
 ): Promise<Map<string, CounterRollup>> {
 	const captured = await readHistoricalMembershipSources(directory);
 	if (!captured.ok) return new Map();
+	const rootKey = canonicalRootKey(directory);
 	try {
-		const rollups = new Map<string, CounterRollup>();
-		// Sealed archive segments are immutable, so each one's contribution is
-		// computed once per process and reused: this runs on the per-message
-		// injection path, which must cost O(live + tail), not O(all history).
-		const rootKey = canonicalRootKey(directory);
-		for (const segment of captured.sources.sealed) {
-			const cacheKey = `${rootKey}|${segment.identity}`;
-			let contribution = sealedSegmentRollupCache.get(cacheKey);
-			if (contribution) {
-				// Refresh recency so hot segments outlive cold ones.
-				sealedSegmentRollupCache.delete(cacheKey);
-			} else {
-				contribution = new Map<string, CounterRollup>();
-				for (const membership of await segment.read()) {
-					foldMembershipIntoRollups(contribution, membership);
-				}
-			}
-			sealedSegmentRollupCache.set(cacheKey, contribution);
-			while (sealedSegmentRollupCache.size > MAX_SEALED_SEGMENT_ROLLUP_CACHE) {
-				const oldest = sealedSegmentRollupCache.keys().next().value;
-				if (oldest === undefined) break;
-				sealedSegmentRollupCache.delete(oldest);
-			}
-			for (const [entryId, rollup] of contribution) {
-				mergeRollupInto(get(rollups, entryId), rollup);
-			}
-		}
+		// Sealed archive segments are immutable and the write path never puts one
+		// key in two segments, so their contribution is computed ONCE per process
+		// (and only the newly sealed ones thereafter): this runs on the
+		// per-message injection path, which must cost O(live + tail), not
+		// O(all history). The first call in a process streams each sealed segment
+		// once, holding only the aggregate.
+		const rollups = await sealedSegmentsRollup(
+			rootKey,
+			captured.sources.sealed,
+		);
 		for (const membership of captured.sources.current) {
 			foldMembershipIntoRollups(rollups, membership);
 		}
 		return rollups;
 	} catch (err) {
-		// Same fail-open posture as an unreadable archive: no counters, never a
-		// crash on the injection path. Live receipt operations are unaffected.
-		warn(
-			`[knowledge-events] authoritative counter rollups unavailable: ${
-				err instanceof Error ? err.message : String(err)
-			}`,
-		);
+		// Fail-open: no counters rather than a crash on the injection path, and
+		// live receipt operations are unaffected. This silently zeroes ranking,
+		// curation and promotion counters, so it must be operator-visible — once
+		// per project per process (the debug-gated warn() would be silent).
+		if (!rollupUnavailableWarned.has(rootKey)) {
+			if (rollupUnavailableWarned.size >= 32) rollupUnavailableWarned.clear();
+			rollupUnavailableWarned.add(rootKey);
+			criticalWarn(
+				`[knowledge-events] authoritative counter rollups unavailable (ranking and promotion counters read as zero): ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+			);
+		}
 		return new Map();
 	}
+}
+
+/**
+ * Cumulative rollup over every sealed segment, returned as a fresh map the
+ * caller may mutate. Extends the cached prefix when new segments sealed;
+ * rebuilds from scratch when any previously folded segment's identity changed.
+ */
+async function sealedSegmentsRollup(
+	rootKey: string,
+	sealed: Array<{
+		identity: string;
+		read: () => Promise<ReceiptMembership[]>;
+	}>,
+): Promise<Map<string, CounterRollup>> {
+	const cached = sealedRollupCache.get(rootKey);
+	const reusable =
+		cached !== undefined &&
+		cached.identities.length <= sealed.length &&
+		cached.identities.every(
+			(identity, index) => identity === sealed[index]?.identity,
+		);
+	const rollup = reusable
+		? cloneRollupMap(cached.rollup)
+		: new Map<string, CounterRollup>();
+	const folded = reusable ? cached.identities.length : 0;
+	if (reusable && folded === sealed.length) return rollup;
+	for (const segment of sealed.slice(folded)) {
+		const contribution = new Map<string, CounterRollup>();
+		for (const membership of await segment.read()) {
+			foldMembershipIntoRollups(contribution, membership);
+		}
+		for (const [entryId, entry] of contribution) {
+			mergeRollupInto(get(rollup, entryId), entry);
+		}
+	}
+	// Store a private copy: the returned map is the caller's to mutate.
+	sealedRollupCache.delete(rootKey);
+	sealedRollupCache.set(rootKey, {
+		identities: sealed.map((segment) => segment.identity),
+		rollup: cloneRollupMap(rollup),
+	});
+	while (sealedRollupCache.size > MAX_SEALED_ROLLUP_CACHE_ROOTS) {
+		const oldest = sealedRollupCache.keys().next().value;
+		if (oldest === undefined) break;
+		sealedRollupCache.delete(oldest);
+	}
+	return rollup;
 }
 
 /** Fold ONE membership into `rollups` (the per-row body of the rollup). */

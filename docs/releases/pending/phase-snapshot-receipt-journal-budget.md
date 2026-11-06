@@ -35,22 +35,26 @@
   journal.** Previously a full archive (10,000 rows / 16 MiB) left every further expired row live
   in the journal, which could then grow toward the 32 MiB read limit and wedge every receipt
   operation. The legacy `knowledge-receipts-v2-archive.jsonl` is now segment 0 and further segments
-  are `knowledge-receipts-v2-archive.NNNNNN.jsonl`. When the active (highest-numbered) segment is
-  full the remainder rolls into a new one; sealed segments are immutable and compaction only ever
-  reads or rewrites the tail, so hot-path cost does not grow with history. The old per-segment
-  bounds are unchanged, nothing is discarded, and no migration is needed: an existing archive file
-  simply becomes the tail. A row already in the tail is skipped only when identical, and a changed
-  copy replaces it, which also closes a window where a terminal filed after an interrupted archive
-  pass could be lost. Readers resolve a key to its newest copy.
+  are `knowledge-receipts-v2-archive.NNNNNN.jsonl`. The highest-numbered segment is the active tail
+  and the only one compaction reads or rewrites; sealed segments are immutable. The old 10,000-row /
+  16 MiB bounds became per-segment append thresholds: a pass that fits the tail is appended to it,
+  otherwise the tail is sealed and the whole pass becomes one new segment. A pass is never split or
+  refused, so nothing is discarded or left live, and no migration is needed: an existing archive
+  file simply becomes the tail. Because a pass is one file, and rows still live in the journal are
+  dropped from the tail before it is sealed, a key is never written into two segments, even across
+  a crash. A row already in the tail is skipped only when identical and a changed copy replaces it,
+  which also closes a window where a terminal filed after an interrupted archive pass could be lost.
 - **Reading history is cheap on the hot path and no longer holds the ledger lock.** The
-  per-message counter rollups reuse an in-process cache of each immutable sealed segment's
-  contribution (keyed by file identity), so after the first call per process they cost live + tail,
-  independent of history size. Full-history queries (`queryHistoricalOutcomes`: outcome history,
-  escalation windows, promotion evidence) read the tail under the lock and the sealed segments after
-  releasing it, bounded by the new `knowledge.receipt_archive_history_budget_mb` (default `128`,
-  raise-only, max `4096`); past it they fail typed and one critical warning is logged. A damaged
-  sealed segment fails those queries with `store_corrupt` without blocking live operations, and a
-  stray non-regular file with a segment name can no longer wedge compaction.
+  per-message counter rollups keep one cumulative rollup of all sealed segments per project (sized
+  by the number of distinct knowledge entries, not by segments), extend it when a segment seals,
+  and rebuild only if a folded segment changes, so after the first call per process they cost live +
+  tail regardless of history size. Full-history queries (`queryHistoricalOutcomes`: outcome
+  history, escalation windows, promotion evidence) read the tail under the lock and the sealed
+  segments after releasing it, bounded by the new `knowledge.receipt_archive_history_budget_mb`
+  (default `128`, raise-only, max `4096`); past it they fail typed and one critical warning is
+  logged. A damaged sealed segment fails those queries with `store_corrupt` without blocking live
+  operations (the rollups then read as zero, with one critical warning). A stray non-regular file
+  with a segment name, including at the base name, can no longer wedge any receipt operation.
 - **`/swarm close` copies every archive segment** into its forensic bundle and still never removes
   them.
 
@@ -61,10 +65,11 @@ rows of a phase that is never closed, and rows of a later plan that reuses a pha
 session that closed that id earlier closes it again (the ledger deduplicates a repeated close for
 the same session and phase id). A journal made only of such rows, or of an unusually large open
 phase, can still grow toward the receipt store's 32 MiB journal read limit, beyond which every
-receipt operation reports `store_corrupt` and `phase_complete` reports `PHASE_SNAPSHOT_BYTE_LIMIT`.
-Archive history is lossless and unbounded on disk. Full-history consumers (outcome history,
-escalation, promotion evidence) stop working past the history read budget until it is raised, and a
-row left in two segments by a crash is counted once per copy by the cached counter rollups.
+receipt operation reports `store_corrupt` and `phase_complete` reports `PHASE_SNAPSHOT_BYTE_LIMIT`;
+`repair_knowledge_receipt_ledger` reads the journal at the same cap, so that state is not
+recoverable. Archive history is lossless and unbounded on disk. Full-history consumers (outcome
+history, escalation, promotion evidence) stop working past the history read budget until it is
+raised.
 
 ## Migration
 
